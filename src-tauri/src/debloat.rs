@@ -444,10 +444,6 @@ pub fn generate_autounattend_xml(cfg: &WindowsCustomConfig) -> String {
     <component name="Microsoft-Windows-Setup" processorArchitecture="amd64" publicKeyToken="31bf3856ad364e35" language="neutral" versionScope="nonSxS">
 {winpe_run_sync}
       <UserData>
-        <ProductKey>
-          <Key></Key>
-          <WillShowUI>OnError</WillShowUI>
-        </ProductKey>
         <AcceptEula>true</AcceptEula>
       </UserData>
     </component>

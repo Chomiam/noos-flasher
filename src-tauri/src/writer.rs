@@ -1092,12 +1092,29 @@ fn run_windows_uefi_flash(
 
     match config.partition_scheme {
         PartitionScheme::Gpt => {
-            if config.fs_type == FileSystemType::Fat32 {
-                let _ = run_checked_command("parted", &["-s", &config.device_path, "set", "1", "esp", "on"]);
-            } else {
+            // Sur une clé USB Windows UEFI en GPT, la partition principale (même en FAT32)
+            // DOIT avoir le GUID `msftdata` (Basic Data Partition : EBD0A0A2-B9E5-4433-87C0-68B6B72699C7)
+            // et NON `esp` (C12A7328-F81F-11D2-BA4B-00A0C93EC93B).
+            // Sous Windows PE (boot.wim), `mountmgr.sys` marque toute partition `esp` comme "Masqué"
+            // sans lettre de lecteur (C:/D:), empêchant setup.exe de trouver `sources\install.swm`
+            // et provoquant l'erreur "Un pilote multimédia dont votre ordinateur a besoin est manquant".
+            let _ = run_checked_command(
+                "parted",
+                &["-s", &config.device_path, "set", "1", "esp", "off"],
+            );
+            let _ = run_checked_command(
+                "parted",
+                &["-s", &config.device_path, "set", "1", "msftdata", "on"],
+            );
+            if has_command("sfdisk") {
                 let _ = run_checked_command(
-                    "parted",
-                    &["-s", &config.device_path, "set", "1", "msftdata", "on"],
+                    "sfdisk",
+                    &[
+                        "--part-type",
+                        &config.device_path,
+                        "1",
+                        "EBD0A0A2-B9E5-4433-87C0-68B6B72699C7",
+                    ],
                 );
             }
         }
@@ -1196,6 +1213,10 @@ fn run_windows_uefi_flash(
     run_checked_command("mount", &["-o", "loop,ro", &config.iso_path, iso_mnt_str])?;
     run_checked_command("mount", &[&part_path, usb_mnt_str])?;
 
+    // Pré-création explicite de /EFI/BOOT en majuscules sur FAT32/NTFS pour une compatibilité UEFI universelle
+    let efi_boot_dir = usb_mnt.join("EFI").join("BOOT");
+    fs::create_dir_all(&efi_boot_dir)?;
+
     // 5. Inspection des fichiers à copier et détection d'un éventuel install.wim > 4 Gio en FAT32
     let mut files_to_copy: Vec<(PathBuf, PathBuf, u64)> = Vec::new();
     let mut split_wim_source: Option<(PathBuf, u64)> = None;
@@ -1212,12 +1233,21 @@ fn run_windows_uefi_flash(
             continue;
         }
 
-        let dst_path = usb_mnt.join(rel_path);
+        let rel_lower = rel_path.to_string_lossy().replace('\\', "/").to_ascii_lowercase();
+        let dst_path = if rel_lower == "efi/boot/bootx64.efi" {
+            efi_boot_dir.join("BOOTX64.EFI")
+        } else if rel_lower == "efi/boot/bootia32.efi" {
+            efi_boot_dir.join("BOOTIA32.EFI")
+        } else if rel_lower == "efi/boot/bootaa64.efi" {
+            efi_boot_dir.join("BOOTAA64.EFI")
+        } else {
+            usb_mnt.join(rel_path)
+        };
+
         if entry.file_type().is_dir() {
             fs::create_dir_all(&dst_path)?;
         } else if entry.file_type().is_file() {
             let file_len = entry.metadata().map(|m| m.len()).unwrap_or(0);
-            let rel_lower = rel_path.to_string_lossy().replace('\\', "/").to_ascii_lowercase();
 
             if config.fs_type == FileSystemType::Fat32
                 && rel_lower == "sources/install.wim"
@@ -1368,6 +1398,18 @@ fn run_windows_uefi_flash(
         copied_bytes += wim_size;
     }
 
+    // 7a. Vérification de secours : s'assurer que /EFI/BOOT/BOOTX64.EFI est bien présent
+    let bootx64_dst = efi_boot_dir.join("BOOTX64.EFI");
+    if !bootx64_dst.exists() {
+        for fallback in ["bootmgfw.efi", "bootmgr.efi"] {
+            let candidate = usb_mnt.join(fallback);
+            if candidate.is_file() {
+                let _ = fs::copy(&candidate, &bootx64_dst);
+                break;
+            }
+        }
+    }
+
     // 7b. Déploiement de autounattend.xml (Compte local Windows) et des scripts PowerShell Debloat ($OEM$)
     if let Some(ref win_custom) = config.windows_custom {
         if win_custom.enabled {
@@ -1392,7 +1434,7 @@ fn run_windows_uefi_flash(
         }
     }
 
-    // 8. Synchronisation finale et démontage propre
+    // 8. Synchronisation finale et démontage propre AVANT l'émission de l'événement 100%
     emit_worker_event(&FlashProgressEvent {
         stage: "Synchronisation des caches et démontage sécurisé...".to_string(),
         percent: 96.0,
@@ -1400,12 +1442,17 @@ fn run_windows_uefi_flash(
         bytes_processed: copied_bytes,
         total_bytes: total_iso_bytes,
         eta_seconds: Some(3),
-        log: Some("Synchronisation des écritures sur la clé USB (sync)...".to_string()),
+        log: Some("Synchronisation des écritures et démontage propre de la clé USB (sync + umount)...".to_string()),
         completed: false,
         error: None,
     });
 
     nix::unistd::sync();
+    let _ = Command::new("umount").arg(&usb_mnt).status();
+    let _ = Command::new("umount").arg(&iso_mnt).status();
+    nix::unistd::sync();
+    let _ = Command::new("partprobe").arg(&config.device_path).status();
+    let _ = Command::new("udevadm").arg("settle").status();
 
     let elapsed_total = start_copy.elapsed().as_secs_f64().max(0.001);
     let avg_speed = (copied_bytes as f64 / (1024.0 * 1024.0)) / elapsed_total;
