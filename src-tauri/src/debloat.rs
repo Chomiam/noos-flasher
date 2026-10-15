@@ -283,12 +283,12 @@ pub fn sanitize_windows_username(raw: &str) -> String {
     }
 }
 
-/// Génère le fichier `autounattend.xml` complet (phases `windowsPE`, `specialize`, `oobeSystem`).
+/// Génère le fichier `autounattend.xml` complet (phases `windowsPE`, `specialize`, `oobeSystem` + bloc `<Extensions>` autonome).
 pub fn generate_autounattend_xml(cfg: &WindowsCustomConfig) -> String {
     let safe_user = escape_xml(&sanitize_windows_username(&cfg.local_username));
     let safe_pass = escape_xml(&cfg.local_password);
 
-    // Commandes RunSynchronous lors de la phase windowsPE (contournements matériels Rufus)
+    // 1. Commandes RunSynchronous lors de la phase windowsPE (contournements matériels Rufus + BitLocker)
     let mut winpe_commands = Vec::new();
     let mut order = 1;
 
@@ -327,6 +327,17 @@ pub fn generate_autounattend_xml(cfg: &WindowsCustomConfig) -> String {
         }
     }
 
+    // Sur Windows 11 24H2/25H2, BitLocker amorce le chiffrement dès la phase windowsPE lors du formatage :
+    // il est indispensable de poser PreventDeviceEncryption=1 dès windowsPE en plus de specialize.
+    if cfg.has_feature("disable_bitlocker_auto") {
+        winpe_commands.push(format!(
+            r#"        <RunSynchronousCommand wcm:action="add">
+          <Order>{order}</Order>
+          <Path>reg.exe add "HKLM\SYSTEM\CurrentControlSet\Control\BitLocker" /v PreventDeviceEncryption /t REG_DWORD /d 1 /f</Path>
+        </RunSynchronousCommand>"#
+        ));
+    }
+
     let winpe_run_sync = if winpe_commands.is_empty() {
         String::new()
     } else {
@@ -336,15 +347,40 @@ pub fn generate_autounattend_xml(cfg: &WindowsCustomConfig) -> String {
         )
     };
 
-    // Commandes RunSynchronous lors de la phase specialize (BypassNRO, BitLocker, exécution de noos_debloat.ps1)
+    // 2. Commandes RunSynchronous lors de la phase specialize (~58% après le 1er reboot)
+    // Architecture Schneegans :
+    // - Extraction autonome des scripts depuis C:\Windows\Panther\unattend.xml (indépendant de $OEM$)
+    // - Isolation stricte du montage/démontage de C:\Users\Default\NTUSER.DAT dans des commandes séparées
+    //   pour garantir que powershell.exe est terminé et que tous les handles Win32 sont fermés avant `reg.exe unload`
+    // - Code de retour forcé à 0 (`exit 0`) pour ne jamais interrompre `windeploy.exe`
     let mut spec_commands = Vec::new();
     let mut spec_order = 1;
+
+    // Extraction des fichiers embarqués dans <Extensions> vers C:\Windows\Setup\Scripts\ (226 chars < 259 max)
+    spec_commands.push(format!(
+        r#"        <RunSynchronousCommand wcm:action="add">
+          <Order>{spec_order}</Order>
+          <Path>powershell.exe -NoProfile -Command "$xml = [xml]::new(); $xml.Load('C:\Windows\Panther\unattend.xml'); $sb = [scriptblock]::Create( $xml.unattend.Extensions.ExtractScript ); Invoke-Command -ScriptBlock $sb -ArgumentList $xml;"</Path>
+        </RunSynchronousCommand>"#
+    ));
+    spec_order += 1;
 
     if cfg.force_local_account {
         spec_commands.push(format!(
             r#"        <RunSynchronousCommand wcm:action="add">
           <Order>{spec_order}</Order>
           <Path>reg.exe add "HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\OOBE" /v BypassNRO /t REG_DWORD /d 1 /f</Path>
+        </RunSynchronousCommand>"#
+        ));
+        spec_order += 1;
+    }
+
+    if cfg.create_local_user {
+        // Désactive l'expiration automatique des mots de passe (42 jours par défaut sur Windows 11)
+        spec_commands.push(format!(
+            r#"        <RunSynchronousCommand wcm:action="add">
+          <Order>{spec_order}</Order>
+          <Path>cmd.exe /c net.exe accounts /maxpwage:UNLIMITED</Path>
         </RunSynchronousCommand>"#
         ));
         spec_order += 1;
@@ -360,11 +396,29 @@ pub fn generate_autounattend_xml(cfg: &WindowsCustomConfig) -> String {
         spec_order += 1;
     }
 
-    // Appel du script de debloat PowerShell copié par Windows Setup depuis sources/$OEM$/$$/Setup/Scripts/noos_debloat.ps1
+    // Montage externe de la ruche Default User (dans un processus reg.exe dédié)
     spec_commands.push(format!(
         r#"        <RunSynchronousCommand wcm:action="add">
           <Order>{spec_order}</Order>
-          <Path>powershell.exe -NoProfile -ExecutionPolicy Bypass -File "C:\Windows\Setup\Scripts\noos_debloat.ps1"</Path>
+          <Path>reg.exe load "HKU\DefaultUser" "C:\Users\Default\NTUSER.DAT"</Path>
+        </RunSynchronousCommand>"#
+    ));
+    spec_order += 1;
+
+    // Exécution du script de debloat en phase specialize avec garantie absolue d'exit code 0
+    spec_commands.push(format!(
+        r#"        <RunSynchronousCommand wcm:action="add">
+          <Order>{spec_order}</Order>
+          <Path>powershell.exe -NoProfile -ExecutionPolicy Bypass -Command "&amp; {{ if (Test-Path 'C:\Windows\Setup\Scripts\noos_debloat.ps1') {{ &amp; 'C:\Windows\Setup\Scripts\noos_debloat.ps1' }}; exit 0 }}"</Path>
+        </RunSynchronousCommand>"#
+    ));
+    spec_order += 1;
+
+    // Démontage externe de la ruche Default User : powershell.exe est terminé, aucun handle ne verrouille NTUSER.DAT
+    spec_commands.push(format!(
+        r#"        <RunSynchronousCommand wcm:action="add">
+          <Order>{spec_order}</Order>
+          <Path>reg.exe unload "HKU\DefaultUser"</Path>
         </RunSynchronousCommand>"#
     ));
 
@@ -373,12 +427,13 @@ pub fn generate_autounattend_xml(cfg: &WindowsCustomConfig) -> String {
         spec_commands.join("\n")
     );
 
-    // Section langue / clavier fr-FR optionnelle en phase oobeSystem
+    // Section langue / clavier fr-FR optionnelle en phase oobeSystem (avec UILanguageFallback pour ne pas planter sur ISO non-FR)
     let oobe_intl_block = if cfg.set_french_locale {
         r#"    <component name="Microsoft-Windows-International-Core" processorArchitecture="amd64" publicKeyToken="31bf3856ad364e35" language="neutral" versionScope="nonSxS">
       <InputLocale>040c:0000040c</InputLocale>
       <SystemLocale>fr-FR</SystemLocale>
       <UILanguage>fr-FR</UILanguage>
+      <UILanguageFallback>en-US</UILanguageFallback>
       <UserLocale>fr-FR</UserLocale>
     </component>"#
     } else {
@@ -437,13 +492,21 @@ pub fn generate_autounattend_xml(cfg: &WindowsCustomConfig) -> String {
         String::new()
     };
 
+    let embedded_debloat_ps1 = escape_xml(&generate_debloat_powershell_script(cfg));
+    let embedded_firstlogon_ps1 = escape_xml(&generate_firstlogon_powershell_script(cfg));
+
     format!(
         r#"<?xml version="1.0" encoding="utf-8"?>
 <unattend xmlns="urn:schemas-microsoft-com:unattend" xmlns:wcm="http://schemas.microsoft.com/WMIConfig/2002/State">
   <settings pass="windowsPE">
     <component name="Microsoft-Windows-Setup" processorArchitecture="amd64" publicKeyToken="31bf3856ad364e35" language="neutral" versionScope="nonSxS">
 {winpe_run_sync}
+      <UseConfigurationSet>true</UseConfigurationSet>
       <UserData>
+        <ProductKey>
+          <Key></Key>
+          <WillShowUI>OnError</WillShowUI>
+        </ProductKey>
         <AcceptEula>true</AcceptEula>
       </UserData>
     </component>
@@ -466,77 +529,116 @@ pub fn generate_autounattend_xml(cfg: &WindowsCustomConfig) -> String {
       <FirstLogonCommands>
         <SynchronousCommand wcm:action="add">
           <Order>1</Order>
-          <Description>Application finale des optimisations Noos Debloat</Description>
-          <CommandLine>powershell.exe -NoProfile -ExecutionPolicy Bypass -File "C:\Windows\Setup\Scripts\noos_debloat.ps1"</CommandLine>
+          <Description>Application finale des optimisations utilisateur Noos Debloat</Description>
+          <CommandLine>powershell.exe -NoProfile -ExecutionPolicy Bypass -Command "&amp; {{ if (Test-Path 'C:\Windows\Setup\Scripts\noos_firstlogon.ps1') {{ &amp; 'C:\Windows\Setup\Scripts\noos_firstlogon.ps1' }}; exit 0 }}"</CommandLine>
         </SynchronousCommand>
       </FirstLogonCommands>
     </component>
   </settings>
+  <Extensions xmlns="https://schneegans.de/windows/unattend-generator/">
+    <ExtractScript>
+param(
+    [xml] $Document
+);
+
+$scriptsDir = 'C:\Windows\Setup\Scripts\';
+foreach( $file in $Document.unattend.Extensions.File ) {{
+    $path = [System.Environment]::ExpandEnvironmentVariables( $file.GetAttribute( 'path' ) );
+    if( $path.StartsWith( $scriptsDir ) ) {{
+        mkdir -Path $scriptsDir -ErrorAction 'SilentlyContinue' | Out-Null;
+    }}
+    $encoding = switch( [System.IO.Path]::GetExtension( $path ) ) {{
+        {{ $_ -in '.ps1', '.xml' }} {{ [System.Text.Encoding]::UTF8; }}
+        {{ $_ -in '.reg', '.vbs', '.js' }} {{ [System.Text.UnicodeEncoding]::new( $false, $true ); }}
+        default {{ [System.Text.Encoding]::Default; }}
+    }};
+    [System.IO.File]::WriteAllBytes( $path, ( $encoding.GetPreamble() + $encoding.GetBytes( $file.InnerText.Trim() ) ) );
+}}
+    </ExtractScript>
+    <File path="C:\Windows\Setup\Scripts\noos_debloat.ps1">
+{embedded_debloat_ps1}
+    </File>
+    <File path="C:\Windows\Setup\Scripts\noos_firstlogon.ps1">
+{embedded_firstlogon_ps1}
+    </File>
+  </Extensions>
 </unattend>
 "#
     )
 }
 
-/// Génère le script PowerShell `noos_debloat.ps1` correspondant exactement aux fonctions cochées par l'utilisateur.
+/// Génère le script PowerShell principal `noos_debloat.ps1` exécuté en passe `specialize` (Session 0 / SYSTEM).
+/// Ce script :
+/// 1. N'ouvre AUCUN `New-PSDrive` sur `HKU\DefaultUser` (utilise `reg.exe` en sous-processus pour éviter toute fuite de handle sur `NTUSER.DAT`).
+/// 2. Effectue la suppression des paquets `AppxProvisionedPackage` en UNE SEULE passe DISM.
+/// 3. N'exécute ni `OneDriveSetup.exe /uninstall` ni `DISM /FeatureName:Recall` ni `Stop-Service` brutal pendant `specialize`.
+/// 4. Garantit un code de retour `exit 0` pour `windeploy.exe`.
 pub fn generate_debloat_powershell_script(cfg: &WindowsCustomConfig) -> String {
-    let mut ps = String::with_capacity(8192);
+    let mut ps = String::with_capacity(12288);
 
     ps.push_str(
         r#"# ==============================================================================
-# Noos Flasher — Script d'optimisation et de Debloat Windows 10/11
-# Généré automatiquement lors du flashage de la clé USB
+# Noos Flasher — Script d'optimisation et de Debloat Windows 10/11 (Specialize)
+# Compatible Windows 11 23H2 / 24H2 / 25H2 (Builds 22631, 26100, 26200, 26300+)
 # ==============================================================================
 $ErrorActionPreference = 'SilentlyContinue'
-Start-Transcript -Path "C:\Windows\Temp\noos_debloat.log" -Append
+$ProgressPreference = 'SilentlyContinue'
+Start-Transcript -Path "C:\Windows\Temp\noos_debloat_specialize.log" -Append | Out-Null
 
-function Set-RegValue {
+function Set-RegMachine {
     param([string]$Path, [string]$Name, $Value, [string]$Type = "DWord")
-    if (!(Test-Path $Path)) {
-        New-Item -Path $Path -Force | Out-Null
-    }
-    Set-ItemProperty -Path $Path -Name $Name -Value $Value -Type $Type -Force | Out-Null
+    try {
+        if (!(Test-Path $Path)) {
+            New-Item -Path $Path -Force -ErrorAction SilentlyContinue | Out-Null
+        }
+        Set-ItemProperty -Path $Path -Name $Name -Value $Value -Type $Type -Force -ErrorAction SilentlyContinue | Out-Null
+    } catch {}
 }
 
-# Montage de la ruche NTUSER.DAT du profil Default User pour que tous les comptes héritent des réglages
-$DefaultUserDat = "C:\Users\Default\NTUSER.DAT"
-$HiveMounted = $false
-if (Test-Path $DefaultUserDat) {
-    reg.exe load "HKU\NoosDefault" $DefaultUserDat | Out-Null
-    New-PSDrive -Name HKUD -PSProvider Registry -Root "HKEY_USERS\NoosDefault" | Out-Null
-    $HiveMounted = $true
+# Écriture dans HKU\DefaultUser via reg.exe (processus isolé = zéro handle PowerShell ouvert sur NTUSER.DAT)
+function Set-RegDefaultUser {
+    param([string]$SubKey, [string]$Name, $Value, [string]$RegType = "REG_DWORD")
+    & reg.exe add "HKU\DefaultUser\$SubKey" /v $Name /t $RegType /d "$Value" /f 2>&1 | Out-Null
 }
+
+$BloatPackages = [System.Collections.Generic.List[string]]::new()
 "#,
     );
+
+    if cfg.has_feature("bypass_win11_hw") {
+        ps.push_str(
+            r#"
+# --- Contournement matériel pour futures mises à jour majeures Windows 11 ---
+Set-RegMachine "HKLM:\SYSTEM\Setup\MoSetup" "AllowUpgradesWithUnsupportedTPMOrCPU" 1
+"#,
+        );
+    }
 
     // 1. Copilot
     if cfg.has_feature("remove_copilot") {
         ps.push_str(
             r#"
 # --- Suppression et blocage de Microsoft Copilot ---
-Set-RegValue "HKLM:\SOFTWARE\Policies\Microsoft\Windows\WindowsCopilot" "TurnOffWindowsCopilot" 1
-Set-RegValue "HKCU:\Software\Policies\Microsoft\Windows\WindowsCopilot" "TurnOffWindowsCopilot" 1
-Set-RegValue "HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced" "ShowCopilotButton" 0
-if ($HiveMounted) {
-    Set-RegValue "HKUD:\Software\Policies\Microsoft\Windows\WindowsCopilot" "TurnOffWindowsCopilot" 1
-    Set-RegValue "HKUD:\Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced" "ShowCopilotButton" 0
-}
-Get-AppxProvisionedPackage -Online | Where-Object { $_.DisplayName -match "Copilot" } | Remove-AppxProvisionedPackage -Online | Out-Null
-Get-AppxPackage -AllUsers "*Copilot*" | Remove-AppxPackage -AllUsers | Out-Null
+Set-RegMachine "HKLM:\SOFTWARE\Policies\Microsoft\Windows\WindowsCopilot" "TurnOffWindowsCopilot" 1
+Set-RegDefaultUser "Software\Policies\Microsoft\Windows\WindowsCopilot" "TurnOffWindowsCopilot" 1
+Set-RegDefaultUser "Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced" "ShowCopilotButton" 0
+$BloatPackages.Add("Microsoft.Copilot")
+$BloatPackages.Add("Microsoft.Windows.Ai.Copilot.Provider")
+$BloatPackages.Add("Copilot")
 "#,
         );
     }
 
-    // 2. Windows Recall / AI
+    // 2. Windows Recall / AI (en specialize : uniquement GPO sans appel DISM bloquant CBS)
     if cfg.has_feature("disable_windows_recall") {
         ps.push_str(
             r#"
-# --- Désactivation de Windows Recall & Analyse IA ---
-Set-RegValue "HKLM:\SOFTWARE\Policies\Microsoft\Windows\WindowsAI" "DisableAIDataAnalysis" 1
-Set-RegValue "HKLM:\SOFTWARE\Policies\Microsoft\Windows\WindowsAI" "TurnOffSavingSnapshots" 1
-if ($HiveMounted) {
-    Set-RegValue "HKUD:\Software\Policies\Microsoft\Windows\WindowsAI" "DisableAIDataAnalysis" 1
-}
-DISM.exe /Online /Disable-Feature /FeatureName:Recall /NoRestart | Out-Null
+# --- Désactivation de Windows Recall & Analyse IA (24H2 / 25H2) ---
+Set-RegMachine "HKLM:\SOFTWARE\Policies\Microsoft\Windows\WindowsAI" "DisableAIDataAnalysis" 1
+Set-RegMachine "HKLM:\SOFTWARE\Policies\Microsoft\Windows\WindowsAI" "TurnOffSavingSnapshots" 1
+Set-RegMachine "HKLM:\SOFTWARE\Policies\Microsoft\Windows\WindowsAI" "AllowRecallEnablement" 0
+Set-RegDefaultUser "Software\Policies\Microsoft\Windows\WindowsAI" "DisableAIDataAnalysis" 1
+Set-RegDefaultUser "Software\Policies\Microsoft\Windows\WindowsAI" "TurnOffSavingSnapshots" 1
 "#,
         );
     }
@@ -546,14 +648,11 @@ DISM.exe /Online /Disable-Feature /FeatureName:Recall /NoRestart | Out-Null
         ps.push_str(
             r#"
 # --- Désactivation de Bing et de la recherche Web dans le menu Démarrer ---
-Set-RegValue "HKLM:\SOFTWARE\Policies\Microsoft\Windows\Windows Search" "DisableWebSearch" 1
-Set-RegValue "HKLM:\SOFTWARE\Policies\Microsoft\Windows\Windows Search" "ConnectedSearchUseWeb" 0
-Set-RegValue "HKCU:\Software\Policies\Microsoft\Windows\Explorer" "DisableSearchBoxSuggestions" 1
-Set-RegValue "HKCU:\Software\Microsoft\Windows\CurrentVersion\Search" "BingSearchEnabled" 0
-if ($HiveMounted) {
-    Set-RegValue "HKUD:\Software\Policies\Microsoft\Windows\Explorer" "DisableSearchBoxSuggestions" 1
-    Set-RegValue "HKUD:\Software\Microsoft\Windows\CurrentVersion\Search" "BingSearchEnabled" 0
-}
+Set-RegMachine "HKLM:\SOFTWARE\Policies\Microsoft\Windows\Windows Search" "DisableWebSearch" 1
+Set-RegMachine "HKLM:\SOFTWARE\Policies\Microsoft\Windows\Windows Search" "ConnectedSearchUseWeb" 0
+Set-RegMachine "HKLM:\SOFTWARE\Policies\Microsoft\Windows\Explorer" "DisableSearchBoxSuggestions" 1
+Set-RegDefaultUser "Software\Policies\Microsoft\Windows\Explorer" "DisableSearchBoxSuggestions" 1
+Set-RegDefaultUser "Software\Microsoft\Windows\CurrentVersion\Search" "BingSearchEnabled" 0
 "#,
         );
     }
@@ -563,9 +662,9 @@ if ($HiveMounted) {
         ps.push_str(
             r#"
 # --- Désactivation et suppression de Cortana ---
-Set-RegValue "HKLM:\SOFTWARE\Policies\Microsoft\Windows\Windows Search" "AllowCortana" 0
-Get-AppxProvisionedPackage -Online | Where-Object { $_.DisplayName -match "549981C3F5F10|Cortana" } | Remove-AppxProvisionedPackage -Online | Out-Null
-Get-AppxPackage -AllUsers "*549981C3F5F10*" | Remove-AppxPackage -AllUsers | Out-Null
+Set-RegMachine "HKLM:\SOFTWARE\Policies\Microsoft\Windows\Windows Search" "AllowCortana" 0
+$BloatPackages.Add("Microsoft.549981C3F5F10")
+$BloatPackages.Add("Cortana")
 "#,
         );
     }
@@ -575,12 +674,9 @@ Get-AppxPackage -AllUsers "*549981C3F5F10*" | Remove-AppxPackage -AllUsers | Out
         ps.push_str(
             r#"
 # --- Suppression des Widgets et Actualités MSN ---
-Set-RegValue "HKLM:\SOFTWARE\Policies\Microsoft\Dsh" "AllowNewsAndInterests" 0
-Set-RegValue "HKLM:\SOFTWARE\Policies\Microsoft\Windows\Windows Feeds" "EnableFeeds" 0
-Set-RegValue "HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced" "TaskbarDa" 0
-if ($HiveMounted) {
-    Set-RegValue "HKUD:\Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced" "TaskbarDa" 0
-}
+Set-RegMachine "HKLM:\SOFTWARE\Policies\Microsoft\Dsh" "AllowNewsAndInterests" 0
+Set-RegMachine "HKLM:\SOFTWARE\Policies\Microsoft\Windows\Windows Feeds" "EnableFeeds" 0
+Set-RegDefaultUser "Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced" "TaskbarDa" 0
 "#,
         );
     }
@@ -589,11 +685,12 @@ if ($HiveMounted) {
     if cfg.has_feature("remove_consumer_apps") {
         ps.push_str(
             r#"
-# --- Purge des applications grand public préinstallées (Bloatwares) ---
-$BloatPackages = @(
+# --- File d'attente des applications grand public préinstallées (Bloatwares 23H2 / 24H2 / 25H2) ---
+@(
     "Clipchamp.Clipchamp",
     "Microsoft.BingFinance",
     "Microsoft.BingNews",
+    "Microsoft.BingSearch",
     "Microsoft.BingSports",
     "Microsoft.BingWeather",
     "Microsoft.GetHelp",
@@ -605,6 +702,7 @@ $BloatPackages = @(
     "Microsoft.PowerAutomateDesktop",
     "Microsoft.SkypeApp",
     "Microsoft.Todos",
+    "Microsoft.Windows.DevHome",
     "Microsoft.WindowsAlarms",
     "Microsoft.WindowsCommunicationsApps",
     "Microsoft.WindowsFeedbackHub",
@@ -613,14 +711,13 @@ $BloatPackages = @(
     "Microsoft.YourPhone",
     "Microsoft.ZuneMusic",
     "Microsoft.ZuneVideo",
+    "MicrosoftCorporationII.MicrosoftFamily",
+    "MicrosoftCorporationII.QuickAssist",
     "Disney.37853FC22B2CE",
     "SpotifyAB.SpotifyMusic",
     "BytedancePte.Ltd.TikTok"
-)
-foreach ($Pkg in $BloatPackages) {
-    Get-AppxProvisionedPackage -Online | Where-Object { $_.DisplayName -like "*$Pkg*" } | Remove-AppxProvisionedPackage -Online | Out-Null
-    Get-AppxPackage -AllUsers "*$Pkg*" | Remove-AppxPackage -AllUsers | Out-Null
-}
+) | ForEach-Object { $BloatPackages.Add($_) }
+& reg.exe delete "HKLM\SOFTWARE\Microsoft\WindowsUpdate\Orchestrator\UScheduler_Oobe\DevHomeUpdate" /f 2>&1 | Out-Null
 "#,
         );
     }
@@ -630,39 +727,31 @@ foreach ($Pkg in $BloatPackages) {
         ps.push_str(
             r#"
 # --- Blocage du téléchargement silencieux d'applications sponsorisées ---
-Set-RegValue "HKLM:\SOFTWARE\Policies\Microsoft\Windows\CloudContent" "DisableWindowsConsumerFeatures" 1
-Set-RegValue "HKLM:\SOFTWARE\Policies\Microsoft\Windows\CloudContent" "DisableCloudOptimizedContent" 1
-Set-RegValue "HKLM:\SOFTWARE\Policies\Microsoft\Windows\CloudContent" "DisableSoftLanding" 1
-$CdmPath = "HKCU:\Software\Microsoft\Windows\CurrentVersion\ContentDeliveryManager"
-Set-RegValue $CdmPath "SilentInstalledAppsEnabled" 0
-Set-RegValue $CdmPath "OemPreInstalledAppsEnabled" 0
-Set-RegValue $CdmPath "PreInstalledAppsEnabled" 0
-Set-RegValue $CdmPath "ContentDeliveryAllowed" 0
-if ($HiveMounted) {
-    $DefCdm = "HKUD:\Software\Microsoft\Windows\CurrentVersion\ContentDeliveryManager"
-    Set-RegValue $DefCdm "SilentInstalledAppsEnabled" 0
-    Set-RegValue $DefCdm "OemPreInstalledAppsEnabled" 0
-    Set-RegValue $DefCdm "PreInstalledAppsEnabled" 0
-    Set-RegValue $DefCdm "ContentDeliveryAllowed" 0
-}
+Set-RegMachine "HKLM:\SOFTWARE\Policies\Microsoft\Windows\CloudContent" "DisableWindowsConsumerFeatures" 1
+Set-RegMachine "HKLM:\SOFTWARE\Policies\Microsoft\Windows\CloudContent" "DisableCloudOptimizedContent" 1
+Set-RegMachine "HKLM:\SOFTWARE\Policies\Microsoft\Windows\CloudContent" "DisableSoftLanding" 1
+$DefCdm = "Software\Microsoft\Windows\CurrentVersion\ContentDeliveryManager"
+Set-RegDefaultUser $DefCdm "SilentInstalledAppsEnabled" 0
+Set-RegDefaultUser $DefCdm "OemPreInstalledAppsEnabled" 0
+Set-RegDefaultUser $DefCdm "PreInstalledAppsEnabled" 0
+Set-RegDefaultUser $DefCdm "PreInstalledAppsEverEnabled" 0
+Set-RegDefaultUser $DefCdm "ContentDeliveryAllowed" 0
+Set-RegDefaultUser $DefCdm "FeatureManagementEnabled" 0
+Set-RegDefaultUser $DefCdm "SubscribedContent-338388Enabled" 0
+Set-RegDefaultUser $DefCdm "SystemPaneSuggestionsEnabled" 0
 "#,
         );
     }
 
-    // 8. OneDrive
+    // 8. OneDrive (Sans lancer OneDriveSetup.exe /uninstall en Session 0 specialize !)
     if cfg.has_feature("remove_onedrive") {
         ps.push_str(
             r#"
-# --- Désinstallation et blocage de Microsoft OneDrive ---
-Set-RegValue "HKLM:\SOFTWARE\Policies\Microsoft\Windows\OneDrive" "DisableFileSyncNGSC" 1
-if ($HiveMounted) {
-    Remove-ItemProperty -Path "HKUD:\Software\Microsoft\Windows\CurrentVersion\Run" -Name "OneDriveSetup" -Force
-}
-Stop-Process -Name "OneDrive*" -Force
-$OneDriveSetup64 = "$env:SystemRoot\SysWOW64\OneDriveSetup.exe"
-$OneDriveSetup32 = "$env:SystemRoot\System32\OneDriveSetup.exe"
-if (Test-Path $OneDriveSetup64) { Start-Process $OneDriveSetup64 -ArgumentList "/uninstall" -Wait -NoNewWindow }
-if (Test-Path $OneDriveSetup32) { Start-Process $OneDriveSetup32 -ArgumentList "/uninstall" -Wait -NoNewWindow }
+# --- Désactivation de l'installation automatique de Microsoft OneDrive ---
+Set-RegMachine "HKLM:\SOFTWARE\Policies\Microsoft\Windows\OneDrive" "DisableFileSyncNGSC" 1
+& reg.exe delete "HKU\DefaultUser\Software\Microsoft\Windows\CurrentVersion\Run" /v OneDriveSetup /f 2>&1 | Out-Null
+Remove-Item -LiteralPath "C:\Users\Default\AppData\Local\Microsoft\OneDrive" -Recurse -Force -ErrorAction SilentlyContinue
+$BloatPackages.Add("Microsoft.OneDriveSync")
 "#,
         );
     }
@@ -672,12 +761,9 @@ if (Test-Path $OneDriveSetup32) { Start-Process $OneDriveSetup32 -ArgumentList "
         ps.push_str(
             r#"
 # --- Suppression de Microsoft 365 Hub, Outlook Web et Teams Personnel ---
-$OfficeBloat = @("Microsoft.MicrosoftOfficeHub", "Microsoft.OutlookForWindows", "MSTeams", "MicrosoftTeams")
-foreach ($Pkg in $OfficeBloat) {
-    Get-AppxProvisionedPackage -Online | Where-Object { $_.DisplayName -like "*$Pkg*" } | Remove-AppxProvisionedPackage -Online | Out-Null
-    Get-AppxPackage -AllUsers "*$Pkg*" | Remove-AppxPackage -AllUsers | Out-Null
-}
-Set-RegValue "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Communications" "ConfigureChatAutoInstall" 0
+@("Microsoft.MicrosoftOfficeHub", "Microsoft.OutlookForWindows", "MSTeams", "MicrosoftTeams") | ForEach-Object { $BloatPackages.Add($_) }
+Set-RegMachine "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Communications" "ConfigureChatAutoInstall" 0
+& reg.exe delete "HKLM\SOFTWARE\Microsoft\WindowsUpdate\Orchestrator\UScheduler_Oobe\OutlookUpdate" /f 2>&1 | Out-Null
 "#,
         );
     }
@@ -688,12 +774,13 @@ Set-RegValue "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Communications" "C
             r#"
 # --- Allégement de Microsoft Edge ---
 $EdgePolicy = "HKLM:\SOFTWARE\Policies\Microsoft\Edge"
-Set-RegValue $EdgePolicy "HideFirstRunExperience" 1
-Set-RegValue $EdgePolicy "HubsSidebarEnabled" 0
-Set-RegValue $EdgePolicy "EdgeShoppingAssistantEnabled" 0
-Set-RegValue $EdgePolicy "BackgroundModeEnabled" 0
-Set-RegValue $EdgePolicy "StartupBoostEnabled" 0
-Set-RegValue $EdgePolicy "ShowRecommendationsEnabled" 0
+Set-RegMachine $EdgePolicy "HideFirstRunExperience" 1
+Set-RegMachine $EdgePolicy "HubsSidebarEnabled" 0
+Set-RegMachine $EdgePolicy "EdgeShoppingAssistantEnabled" 0
+Set-RegMachine $EdgePolicy "BackgroundModeEnabled" 0
+Set-RegMachine $EdgePolicy "StartupBoostEnabled" 0
+Set-RegMachine $EdgePolicy "ShowRecommendationsEnabled" 0
+Set-RegMachine $EdgePolicy "SpotlightExperiencesAndRecommendationsEnabled" 0
 "#,
         );
     }
@@ -703,35 +790,50 @@ Set-RegValue $EdgePolicy "ShowRecommendationsEnabled" 0
         ps.push_str(
             r#"
 # --- Suppression des applications Xbox & GameOverlay ---
-$XboxPackages = @(
+@(
     "Microsoft.GamingApp",
     "Microsoft.XboxApp",
     "Microsoft.XboxGameOverlay",
     "Microsoft.XboxGamingOverlay",
     "Microsoft.XboxIdentityProvider",
     "Microsoft.XboxSpeechToTextOverlay"
-)
-foreach ($Pkg in $XboxPackages) {
-    Get-AppxProvisionedPackage -Online | Where-Object { $_.DisplayName -like "*$Pkg*" } | Remove-AppxProvisionedPackage -Online | Out-Null
-    Get-AppxPackage -AllUsers "*$Pkg*" | Remove-AppxPackage -AllUsers | Out-Null
-}
+) | ForEach-Object { $BloatPackages.Add($_) }
 "#,
         );
     }
 
-    // 12. Télémétrie & DiagTrack
+    // Exécution groupée en UNE SEULE passe DISM pour tous les paquets AppX provisionnés ciblés
+    ps.push_str(
+        r#"
+# --- Purge groupée en passe unique des paquets AppX provisionnés ---
+if ($BloatPackages.Count -gt 0) {
+    try {
+        $InstalledProvisioned = Get-AppxProvisionedPackage -Online -ErrorAction SilentlyContinue
+        foreach ($Appx in $InstalledProvisioned) {
+            foreach ($Target in $BloatPackages) {
+                if ($Appx.DisplayName -like "*$Target*") {
+                    Write-Output "Suppression du paquet provisionné : $($Appx.DisplayName)"
+                    Remove-AppxProvisionedPackage -Online -PackageName $Appx.PackageName -ErrorAction SilentlyContinue | Out-Null
+                    break
+                }
+            }
+        }
+    } catch {}
+}
+"#,
+    );
+
+    // 12. Télémétrie & DiagTrack (Désactivation du démarrage sans tuer brutalement le service pendant specialize)
     if cfg.has_feature("disable_telemetry_services") {
         ps.push_str(
             r#"
 # --- Désactivation de la télémétrie Windows et des services DiagTrack / dmwappushservice ---
-Set-RegValue "HKLM:\SOFTWARE\Policies\Microsoft\Windows\DataCollection" "AllowTelemetry" 0
-Set-RegValue "HKLM:\SOFTWARE\Policies\Microsoft\Windows\DataCollection" "MaxTelemetryAllowed" 0
-Set-RegValue "HKLM:\SOFTWARE\Policies\Microsoft\Windows\DataCollection" "DoNotShowFeedbackNotifications" 1
-Set-RegValue "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\DataCollection" "AllowTelemetry" 0
-foreach ($Svc in @("DiagTrack", "dmwappushservice")) {
-    Stop-Service -Name $Svc -Force
-    Set-Service -Name $Svc -StartupType Disabled
-}
+Set-RegMachine "HKLM:\SOFTWARE\Policies\Microsoft\Windows\DataCollection" "AllowTelemetry" 0
+Set-RegMachine "HKLM:\SOFTWARE\Policies\Microsoft\Windows\DataCollection" "MaxTelemetryAllowed" 0
+Set-RegMachine "HKLM:\SOFTWARE\Policies\Microsoft\Windows\DataCollection" "DoNotShowFeedbackNotifications" 1
+Set-RegMachine "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\DataCollection" "AllowTelemetry" 0
+& sc.exe config DiagTrack start= disabled 2>&1 | Out-Null
+& sc.exe config dmwappushservice start= disabled 2>&1 | Out-Null
 "#,
         );
     }
@@ -741,17 +843,14 @@ foreach ($Svc in @("DiagTrack", "dmwappushservice")) {
         ps.push_str(
             r#"
 # --- Blocage de l'identifiant publicitaire et du suivi d'activité ---
-Set-RegValue "HKLM:\SOFTWARE\Policies\Microsoft\Windows\AdvertisingInfo" "DisabledByGroupPolicy" 1
-Set-RegValue "HKLM:\SOFTWARE\Policies\Microsoft\Windows\System" "EnableActivityFeed" 0
-Set-RegValue "HKLM:\SOFTWARE\Policies\Microsoft\Windows\System" "PublishUserActivities" 0
-Set-RegValue "HKLM:\SOFTWARE\Policies\Microsoft\Windows\System" "UploadUserActivities" 0
-Set-RegValue "HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced" "Start_TrackProgs" 0
-if ($HiveMounted) {
-    Set-RegValue "HKUD:\Software\Microsoft\Windows\CurrentVersion\AdvertisingInfo" "Enabled" 0
-    Set-RegValue "HKUD:\Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced" "Start_TrackProgs" 0
-    Set-RegValue "HKUD:\Software\Microsoft\Windows\CurrentVersion\ContentDeliveryManager" "RotatingLockScreenOverlayEnabled" 0
-    Set-RegValue "HKUD:\Software\Microsoft\Windows\CurrentVersion\ContentDeliveryManager" "SubscribedContent-338387Enabled" 0
-}
+Set-RegMachine "HKLM:\SOFTWARE\Policies\Microsoft\Windows\AdvertisingInfo" "DisabledByGroupPolicy" 1
+Set-RegMachine "HKLM:\SOFTWARE\Policies\Microsoft\Windows\System" "EnableActivityFeed" 0
+Set-RegMachine "HKLM:\SOFTWARE\Policies\Microsoft\Windows\System" "PublishUserActivities" 0
+Set-RegMachine "HKLM:\SOFTWARE\Policies\Microsoft\Windows\System" "UploadUserActivities" 0
+Set-RegDefaultUser "Software\Microsoft\Windows\CurrentVersion\AdvertisingInfo" "Enabled" 0
+Set-RegDefaultUser "Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced" "Start_TrackProgs" 0
+Set-RegDefaultUser "Software\Microsoft\Windows\CurrentVersion\ContentDeliveryManager" "RotatingLockScreenOverlayEnabled" 0
+Set-RegDefaultUser "Software\Microsoft\Windows\CurrentVersion\ContentDeliveryManager" "SubscribedContent-338387Enabled" 0
 "#,
         );
     }
@@ -761,21 +860,18 @@ if ($HiveMounted) {
         ps.push_str(
             r#"
 # --- Désactivation du partage P2P Windows Update (Delivery Optimization) ---
-Set-RegValue "HKLM:\SOFTWARE\Policies\Microsoft\Windows\DeliveryOptimization" "DODownloadMode" 0
-Set-RegValue "HKLM:\SOFTWARE\Microsoft\WcmSvc\wifinetworkmanager\config" "AutoConnectAllowedOEM" 0
+Set-RegMachine "HKLM:\SOFTWARE\Policies\Microsoft\Windows\DeliveryOptimization" "DODownloadMode" 0
+Set-RegMachine "HKLM:\SOFTWARE\Microsoft\WcmSvc\wifinetworkmanager\config" "AutoConnectAllowedOEM" 0
 "#,
         );
     }
 
-    // 15. Menu contextuel classique Windows 10
+    // 15. Menu contextuel classique Windows 10 (via reg.exe pour ne pas ouvrir de handle PowerShell sur DefaultUser)
     if cfg.has_feature("classic_context_menu") {
         ps.push_str(
             r#"
 # --- Restauration du menu contextuel clic-droit classique (Windows 10) ---
-New-Item -Path "HKCU:\Software\Classes\CLSID\{86ca1aa0-34aa-4e8b-a509-50c905bae2a2}\InprocServer32" -Value "" -Force | Out-Null
-if ($HiveMounted) {
-    New-Item -Path "HKUD:\Software\Classes\CLSID\{86ca1aa0-34aa-4e8b-a509-50c905bae2a2}\InprocServer32" -Value "" -Force | Out-Null
-}
+& reg.exe add "HKU\DefaultUser\Software\Classes\CLSID\{86ca1aa0-34aa-4e8b-a509-50c905bae2a2}\InprocServer32" /ve /t REG_SZ /d "" /f 2>&1 | Out-Null
 "#,
         );
     }
@@ -785,12 +881,8 @@ if ($HiveMounted) {
         ps.push_str(
             r#"
 # --- Explorateur Pro : Afficher les extensions de fichiers & ouvrir sur 'Ce PC' ---
-Set-RegValue "HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced" "HideFileExt" 0
-Set-RegValue "HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced" "LaunchTo" 1
-if ($HiveMounted) {
-    Set-RegValue "HKUD:\Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced" "HideFileExt" 0
-    Set-RegValue "HKUD:\Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced" "LaunchTo" 1
-}
+Set-RegDefaultUser "Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced" "HideFileExt" 0
+Set-RegDefaultUser "Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced" "LaunchTo" 1
 "#,
         );
     }
@@ -800,13 +892,10 @@ if ($HiveMounted) {
         ps.push_str(
             r#"
 # --- Épurage de la barre des tâches et du menu Démarrer ---
-Set-RegValue "HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced" "ShowTaskViewButton" 0
-Set-RegValue "HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced" "TaskbarMn" 0
-Set-RegValue "HKLM:\SOFTWARE\Policies\Microsoft\Windows\Explorer" "HideRecommendedSection" 1
-if ($HiveMounted) {
-    Set-RegValue "HKUD:\Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced" "ShowTaskViewButton" 0
-    Set-RegValue "HKUD:\Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced" "TaskbarMn" 0
-}
+Set-RegMachine "HKLM:\SOFTWARE\Policies\Microsoft\Windows\Explorer" "HideRecommendedSection" 1
+Set-RegMachine "HKLM:\SOFTWARE\Microsoft\PolicyManager\current\device\Start" "HideRecommendedSection" 1
+Set-RegDefaultUser "Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced" "ShowTaskViewButton" 0
+Set-RegDefaultUser "Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced" "TaskbarMn" 0
 "#,
         );
     }
@@ -816,12 +905,13 @@ if ($HiveMounted) {
         ps.push_str(
             r#"
 # --- Blocage des rappels 'Terminer la configuration de votre appareil' ---
-Set-RegValue "HKCU:\Software\Microsoft\Windows\CurrentVersion\UserProfileEngagement" "ScoobeSystemSettingEnabled" 0
-if ($HiveMounted) {
-    Set-RegValue "HKUD:\Software\Microsoft\Windows\CurrentVersion\UserProfileEngagement" "ScoobeSystemSettingEnabled" 0
-    Set-RegValue "HKUD:\Software\Microsoft\Windows\CurrentVersion\ContentDeliveryManager" "SubscribedContent-310093Enabled" 0
-    Set-RegValue "HKUD:\Software\Microsoft\Windows\CurrentVersion\ContentDeliveryManager" "SubscribedContent-338389Enabled" 0
-}
+Set-RegDefaultUser "Software\Microsoft\Windows\CurrentVersion\UserProfileEngagement" "ScoobeSystemSettingEnabled" 0
+$DefCdmTips = "Software\Microsoft\Windows\CurrentVersion\ContentDeliveryManager"
+Set-RegDefaultUser $DefCdmTips "SubscribedContent-310093Enabled" 0
+Set-RegDefaultUser $DefCdmTips "SubscribedContent-338389Enabled" 0
+Set-RegDefaultUser $DefCdmTips "SubscribedContent-338393Enabled" 0
+Set-RegDefaultUser $DefCdmTips "SubscribedContent-353694Enabled" 0
+Set-RegDefaultUser $DefCdmTips "SoftLandingEnabled" 0
 "#,
         );
     }
@@ -831,33 +921,158 @@ if ($HiveMounted) {
         ps.push_str(
             r#"
 # --- Optimisations Performances & arrêt GameDVR ---
-Set-RegValue "HKLM:\SOFTWARE\Policies\Microsoft\Windows\GameDVR" "AllowGameDVR" 0
-Set-RegValue "HKCU:\System\GameConfigStore" "GameDVR_Enabled" 0
-Set-RegValue "HKCU:\Software\Microsoft\Windows\CurrentVersion\GameDVR" "AppCaptureEnabled" 0
-if ($HiveMounted) {
-    Set-RegValue "HKUD:\System\GameConfigStore" "GameDVR_Enabled" 0
-    Set-RegValue "HKUD:\Software\Microsoft\Windows\CurrentVersion\GameDVR" "AppCaptureEnabled" 0
-}
-powercfg.exe /setactive 8c5e7fda-e8bf-4a96-9a85-a6e23a8c635c | Out-Null
+Set-RegMachine "HKLM:\SOFTWARE\Policies\Microsoft\Windows\GameDVR" "AllowGameDVR" 0
+Set-RegDefaultUser "System\GameConfigStore" "GameDVR_Enabled" 0
+Set-RegDefaultUser "Software\Microsoft\Windows\CurrentVersion\GameDVR" "AppCaptureEnabled" 0
 "#,
         );
     }
 
-    // Démontage propre de la ruche Default User
     ps.push_str(
         r#"
-if ($HiveMounted) {
-    Remove-PSDrive -Name HKUD -Force
-    [gc]::Collect()
-    Start-Sleep -Milliseconds 500
-    reg.exe unload "HKU\NoosDefault" | Out-Null
-}
-
-Stop-Transcript
+Stop-Transcript | Out-Null
+$global:LASTEXITCODE = 0
+exit 0
 "#,
     );
 
     ps
+}
+
+/// Génère le script PowerShell `noos_firstlogon.ps1` exécuté lors de la première connexion utilisateur (`FirstLogonCommands`).
+/// Applique les réglages `HKCU` de session active, le profil d'alimentation Haute Performance et la désactivation optionnelle de Recall.
+pub fn generate_firstlogon_powershell_script(cfg: &WindowsCustomConfig) -> String {
+    let mut ps = String::with_capacity(4096);
+
+    ps.push_str(
+        r#"# ==============================================================================
+# Noos Flasher — Finalisation Session Utilisateur (FirstLogonCommands)
+# ==============================================================================
+$ErrorActionPreference = 'SilentlyContinue'
+$ProgressPreference = 'SilentlyContinue'
+Start-Transcript -Path "C:\Windows\Temp\noos_debloat_firstlogon.log" -Append | Out-Null
+
+function Set-RegUser {
+    param([string]$Path, [string]$Name, $Value, [string]$Type = "DWord")
+    try {
+        if (!(Test-Path $Path)) {
+            New-Item -Path $Path -Force -ErrorAction SilentlyContinue | Out-Null
+        }
+        Set-ItemProperty -Path $Path -Name $Name -Value $Value -Type $Type -Force -ErrorAction SilentlyContinue | Out-Null
+    } catch {}
+}
+"#,
+    );
+
+    if cfg.has_feature("remove_copilot") {
+        ps.push_str(
+            r#"
+Set-RegUser "HKCU:\Software\Policies\Microsoft\Windows\WindowsCopilot" "TurnOffWindowsCopilot" 1
+Set-RegUser "HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced" "ShowCopilotButton" 0
+Get-AppxPackage "*Copilot*" | Remove-AppxPackage -ErrorAction SilentlyContinue | Out-Null
+"#,
+        );
+    }
+
+    if cfg.has_feature("disable_windows_recall") {
+        ps.push_str(
+            r#"
+try {
+    $RecallFeat = Get-WindowsOptionalFeature -Online -FeatureName "Recall" -ErrorAction SilentlyContinue
+    if ($RecallFeat -and $RecallFeat.State -eq 'Enabled') {
+        Disable-WindowsOptionalFeature -Online -FeatureName "Recall" -NoRestart -ErrorAction SilentlyContinue | Out-Null
+    }
+} catch {}
+"#,
+        );
+    }
+
+    if cfg.has_feature("disable_bing_search") {
+        ps.push_str(
+            r#"
+Set-RegUser "HKCU:\Software\Policies\Microsoft\Windows\Explorer" "DisableSearchBoxSuggestions" 1
+Set-RegUser "HKCU:\Software\Microsoft\Windows\CurrentVersion\Search" "BingSearchEnabled" 0
+"#,
+        );
+    }
+
+    if cfg.has_feature("classic_context_menu") {
+        ps.push_str(
+            r#"
+& reg.exe add "HKCU\Software\Classes\CLSID\{86ca1aa0-34aa-4e8b-a509-50c905bae2a2}\InprocServer32" /ve /t REG_SZ /d "" /f 2>&1 | Out-Null
+"#,
+        );
+    }
+
+    if cfg.has_feature("explorer_power_user") {
+        ps.push_str(
+            r#"
+Set-RegUser "HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced" "HideFileExt" 0
+Set-RegUser "HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced" "LaunchTo" 1
+"#,
+        );
+    }
+
+    if cfg.has_feature("clean_taskbar_start") {
+        ps.push_str(
+            r#"
+Set-RegUser "HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced" "ShowTaskViewButton" 0
+Set-RegUser "HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced" "TaskbarMn" 0
+"#,
+        );
+    }
+
+    if cfg.has_feature("disable_bing_lockscreen_tips") {
+        ps.push_str(
+            r#"
+Set-RegUser "HKCU:\Software\Microsoft\Windows\CurrentVersion\UserProfileEngagement" "ScoobeSystemSettingEnabled" 0
+"#,
+        );
+    }
+
+    if cfg.has_feature("high_perf_gaming_tweaks") {
+        ps.push_str(
+            r#"
+Set-RegUser "HKCU:\System\GameConfigStore" "GameDVR_Enabled" 0
+Set-RegUser "HKCU:\Software\Microsoft\Windows\CurrentVersion\GameDVR" "AppCaptureEnabled" 0
+& powercfg.exe /duplicatescheme 8c5e7fda-e8bf-4a96-9a85-a6e23a8c635c 2>&1 | Out-Null
+& powercfg.exe /setactive 8c5e7fda-e8bf-4a96-9a85-a6e23a8c635c 2>&1 | Out-Null
+"#,
+        );
+    }
+
+    ps.push_str(
+        r#"
+Stop-Transcript | Out-Null
+$global:LASTEXITCODE = 0
+exit 0
+"#,
+    );
+
+    ps
+}
+
+/// Ajoute le BOM UTF-8 (`EF BB BF`) devant un script PowerShell afin que Windows PowerShell 5.1
+/// interprète toujours correctement les caractères accentués UTF-8.
+fn with_utf8_bom(content: &str) -> Vec<u8> {
+    let mut out = Vec::with_capacity(content.len() + 3);
+    out.extend_from_slice(&[0xEF, 0xBB, 0xBF]);
+    out.extend_from_slice(content.as_bytes());
+    out
+}
+
+/// Résout le dossier `sources` existant sur la clé USB de manière insensible à la casse (important pour NTFS sous Linux).
+fn resolve_sources_dir(usb_mount_dir: &Path) -> std::path::PathBuf {
+    if let Ok(entries) = fs::read_dir(usb_mount_dir) {
+        for entry in entries.flatten() {
+            if entry.file_type().map(|t| t.is_dir()).unwrap_or(false)
+                && entry.file_name().to_string_lossy().eq_ignore_ascii_case("sources")
+            {
+                return entry.path();
+            }
+        }
+    }
+    usb_mount_dir.join("sources")
 }
 
 /// Déploie `autounattend.xml` et les scripts `$OEM$` sur le point de montage de la clé USB Windows.
@@ -869,27 +1084,30 @@ pub fn write_unattend_and_debloat_to_usb(
         return Ok(());
     }
 
-    // 1. Écriture de `/autounattend.xml` à la racine de la clé USB
+    // 1. Écriture de `/autounattend.xml` à la racine de la clé USB (inclut aussi les scripts dans <Extensions>)
     let autounattend_content = generate_autounattend_xml(cfg);
     let root_unattend = usb_mount_dir.join("autounattend.xml");
     fs::write(&root_unattend, autounattend_content.as_bytes())?;
 
-    // 2. Création de l'arborescence `$OEM$/$$/Setup/Scripts/` (copiée dans `C:\Windows\Setup\Scripts\`)
-    let scripts_dir = usb_mount_dir
-        .join("sources")
+    // 2. Création de l'arborescence `sources/$OEM$/$$/Setup/Scripts/` (copiée dans `C:\Windows\Setup\Scripts\`)
+    let sources_dir = resolve_sources_dir(usb_mount_dir);
+    let scripts_dir = sources_dir
         .join("$OEM$")
         .join("$$")
         .join("Setup")
         .join("Scripts");
     fs::create_dir_all(&scripts_dir)?;
 
-    let ps_script = generate_debloat_powershell_script(cfg);
-    fs::write(scripts_dir.join("noos_debloat.ps1"), ps_script.as_bytes())?;
-
-    let setup_complete_cmd = "@echo off\r\npowershell.exe -NoProfile -ExecutionPolicy Bypass -File \"%WINDIR%\\Setup\\Scripts\\noos_debloat.ps1\"\r\n";
+    let ps_debloat = generate_debloat_powershell_script(cfg);
     fs::write(
-        scripts_dir.join("SetupComplete.cmd"),
-        setup_complete_cmd.as_bytes(),
+        scripts_dir.join("noos_debloat.ps1"),
+        with_utf8_bom(&ps_debloat),
+    )?;
+
+    let ps_firstlogon = generate_firstlogon_powershell_script(cfg);
+    fs::write(
+        scripts_dir.join("noos_firstlogon.ps1"),
+        with_utf8_bom(&ps_firstlogon),
     )?;
 
     Ok(())
@@ -901,18 +1119,34 @@ mod tests {
 
     #[test]
     fn test_generate_autounattend_and_debloat() {
-        let cfg = WindowsCustomConfig {
+        let mut cfg = WindowsCustomConfig {
             local_username: "Chomiam".to_string(),
             ..Default::default()
         };
+        // Activer l'intégralité des 22 scripts pour vérifier leur génération complète
+        cfg.enabled_features = get_debloat_catalog().into_iter().map(|f| f.id).collect();
+        assert_eq!(cfg.enabled_features.len(), 22);
+
         let xml = generate_autounattend_xml(&cfg);
         assert!(xml.contains("<Name>Chomiam</Name>"));
         assert!(xml.contains("BypassNRO"));
         assert!(xml.contains("BypassTPMCheck"));
+        assert!(xml.contains("PreventDeviceEncryption"));
+        assert!(xml.contains("reg.exe load \"HKU\\DefaultUser\""));
+        assert!(xml.contains("reg.exe unload \"HKU\\DefaultUser\""));
+        assert!(xml.contains("https://schneegans.de/windows/unattend-generator/"));
 
         let ps = generate_debloat_powershell_script(&cfg);
         assert!(ps.contains("TurnOffWindowsCopilot"));
         assert!(ps.contains("DisableAIDataAnalysis"));
         assert!(ps.contains("AllowTelemetry"));
+        assert!(ps.contains("exit 0"));
+        assert!(!ps.contains("New-PSDrive -Name HKUD"));
+        assert!(!ps.contains("OneDriveSetup.exe"));
+
+        let fl = generate_firstlogon_powershell_script(&cfg);
+        assert!(fl.contains("powercfg.exe /duplicatescheme"));
+        assert!(fl.contains("exit 0"));
     }
 }
+

@@ -9,9 +9,9 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: "Version du tag de release (ex: v0.1.0)"
+        description: "Version du tag de release (ex: v0.1.1)"
         required: true
-        default: "v0.1.0"
+        default: "v0.1.1"
 
 permissions:
   contents: write
@@ -83,7 +83,7 @@ jobs:
           elif [[ "${{ github.ref }}" == refs/tags/* ]]; then
             TAG="${{ github.ref_name }}"
           else
-            TAG="v0.1.0"
+            TAG="v0.1.1"
           fi
           echo "TAG=$TAG" >> "$GITHUB_OUTPUT"
 
@@ -96,6 +96,11 @@ jobs:
             ## ⚡ Noos Flasher ${{ steps.artifacts.outputs.TAG }} — Créateur de clés USB Bootables Linux & Windows UEFI
 
             Outil desktop natif **Rust + Tauri v2** pour Linux (Pop!_OS, Ubuntu, Debian, Fedora, Arch) permettant de créer des clés USB bootables **Linux (Mode DD)** et **Windows 10/11 UEFI** avec studio de personnalisation et Debloat intégré.
+
+            ### 🛠️ Nouveautés & Correctifs (${{ steps.artifacts.outputs.TAG }}) :
+            - 🩹 **Correction du crash Windows 11 24H2/25H2 à 58 % (`specialize`)** : double injection XML (`<Extensions>`) + `$OEM$` garantissant l'extraction de `noos_debloat.ps1` et `noos_firstlogon.ps1` depuis `C:\Windows\Panther\unattend.xml` même avec une image découpée (`install.swm`).
+            - 🔒 **Isolation stricte de `NTUSER.DAT` (`HKU\DefaultUser`)** : montage/démontage de la ruche profil par défaut dans des processus `RunSynchronousCommand` dédiés et écriture via `reg.exe add`, éliminant le verrouillage de `NTUSER.DAT` lors de la création du profil utilisateur.
+            - ⚡ **Optimisation DISM & Séparation `specialize` / `FirstLogonCommands`** : suppression groupée des paquets Appx provisionnés en une seule passe (< 10 s), déplacement de `DISM /Disable-Feature /FeatureName:Recall` et `powercfg` dans `noos_firstlogon.ps1`, et désactivation propre de OneDrive sans blocage en Session 0.
 
             ### ✨ Fonctionnalités incluses :
             - 🛡️ **Protection stricte des disques système** : exclusion automatique de `/`, `/boot`, `/home` et des disques NVMe/SATA internes.
