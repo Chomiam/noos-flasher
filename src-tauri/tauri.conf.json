@@ -1,6 +1,6 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
-  "productName": "Noos USB & Windows Installer",
+  "productName": "Noos-Flasher",
   "version": "0.1.0",
   "identifier": "io.noos.wininstaller",
   "build": {
@@ -28,10 +28,7 @@
   },
   "bundle": {
     "active": true,
-    "targets": "all",
-    "resources": [
-      "resources/wimtools/*"
-    ],
+    "targets": ["deb", "rpm", "appimage"],
     "linux": {
       "deb": {
         "depends": [
