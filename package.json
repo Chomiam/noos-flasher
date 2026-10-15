@@ -1,0 +1,14 @@
+{
+  "name": "noos-win-installer",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Outil desktop moderne de création de clés USB bootables Linux (DD) & Windows UEFI (Tauri v2)",
+  "scripts": {
+    "tauri": "tauri",
+    "dev": "tauri dev",
+    "build": "tauri build"
+  },
+  "devDependencies": {
+    "@tauri-apps/cli": "^2.1.0"
+  }
+}

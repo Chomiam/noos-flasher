@@ -1,0 +1,12 @@
+# Rust / Cargo
+target/
+**/target/
+
+# Node / Tauri
+node_modules/
+dist/
+
+# Fichiers temporaires et OS
+.DS_Store
+*.swp
+*.log

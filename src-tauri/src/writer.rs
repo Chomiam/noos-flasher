@@ -1,0 +1,1431 @@
+use crate::debloat::{write_unattend_and_debloat_to_usb, WindowsCustomConfig};
+use crate::drive::{format_size, partition_path_for_disk, validate_target_device};
+use crate::error::{AppError, AppResult};
+use serde::{Deserialize, Serialize};
+use std::fs::{self, File, OpenOptions};
+use std::io::{Read, Seek, SeekFrom, Write};
+use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
+use std::thread;
+use std::time::{Duration, Instant};
+use tauri::{AppHandle, Emitter};
+use tokio::io::{AsyncBufReadExt, BufReader};
+use walkdir::WalkDir;
+
+/// Taille maximale d'un fichier sur un système de fichiers FAT32 (4 Gio - 1 octet).
+pub const FAT32_MAX_FILE_SIZE: u64 = 4_294_967_295;
+
+/// Préfixe de protocole utilisé par le worker privilégié (`pkexec`) sur `stdout`.
+const PROGRESS_PREFIX: &str = "PROGRESS_JSON:";
+
+/// Mode d'écriture sur la clé USB.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FlashMode {
+    LinuxDd,
+    WindowsUefi,
+}
+
+impl FlashMode {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::LinuxDd => "linux_dd",
+            Self::WindowsUefi => "windows_uefi",
+        }
+    }
+
+    pub fn from_arg(val: &str) -> AppResult<Self> {
+        match val.trim().to_ascii_lowercase().as_str() {
+            "linux_dd" | "dd" => Ok(Self::LinuxDd),
+            "windows_uefi" | "windows" => Ok(Self::WindowsUefi),
+            other => Err(AppError::Other(anyhow::anyhow!(
+                "Mode de flashage inconnu : '{other}'"
+            ))),
+        }
+    }
+}
+
+/// Schéma de table de partitions pour le mode Windows UEFI.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PartitionScheme {
+    Gpt,
+    Mbr,
+}
+
+impl PartitionScheme {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Gpt => "gpt",
+            Self::Mbr => "mbr",
+        }
+    }
+
+    pub fn from_arg(val: &str) -> AppResult<Self> {
+        match val.trim().to_ascii_lowercase().as_str() {
+            "gpt" => Ok(Self::Gpt),
+            "mbr" | "msdos" => Ok(Self::Mbr),
+            other => Err(AppError::Other(anyhow::anyhow!(
+                "Schéma de partitionnement inconnu : '{other}'"
+            ))),
+        }
+    }
+}
+
+/// Système de fichiers cible pour le mode Windows UEFI.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FileSystemType {
+    Fat32,
+    Ntfs,
+}
+
+impl FileSystemType {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Fat32 => "fat32",
+            Self::Ntfs => "ntfs",
+        }
+    }
+
+    pub fn from_arg(val: &str) -> AppResult<Self> {
+        match val.trim().to_ascii_lowercase().as_str() {
+            "fat32" | "vfat" => Ok(Self::Fat32),
+            "ntfs" => Ok(Self::Ntfs),
+            other => Err(AppError::Other(anyhow::anyhow!(
+                "Système de fichiers inconnu : '{other}'"
+            ))),
+        }
+    }
+}
+
+/// Classification détectée lors de l'analyse d'un fichier `.iso` ou `.img`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum IsoKind {
+    LinuxHybrid,
+    WindowsUefi,
+    StandardIso,
+    RawImage,
+}
+
+/// Résultat complet de l'inspection d'une image ISO ou IMG.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct IsoInspection {
+    pub path: String,
+    pub file_name: String,
+    pub size_bytes: u64,
+    pub size_formatted: String,
+    pub kind: IsoKind,
+    pub kind_label: String,
+    pub volume_label: String,
+    pub is_hybrid_mbr: bool,
+    pub has_gpt_header: bool,
+    pub has_el_torito: bool,
+    pub is_udf: bool,
+    pub is_windows_iso: bool,
+    pub install_wim_size: Option<u64>,
+    pub install_wim_formatted: Option<String>,
+    pub requires_wim_split_for_fat32: bool,
+    pub wimlib_available: bool,
+    pub recommended_mode: FlashMode,
+    pub recommended_scheme: PartitionScheme,
+    pub recommended_fs: FileSystemType,
+    pub details: String,
+}
+
+/// État des outils système installés sur l'hôte Linux.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SystemCapabilities {
+    pub pkexec: bool,
+    pub lsblk: bool,
+    pub parted: bool,
+    pub mkfs_vfat: bool,
+    pub mkfs_ntfs: bool,
+    pub seven_zip: bool,
+    pub wimlib_imagex: bool,
+}
+
+/// Paramètres d'une tâche d'écriture USB.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FlashJobConfig {
+    pub device_path: String,
+    pub iso_path: String,
+    pub mode: FlashMode,
+    pub partition_scheme: PartitionScheme,
+    pub fs_type: FileSystemType,
+    pub volume_label: String,
+    #[serde(default)]
+    pub windows_custom: Option<WindowsCustomConfig>,
+}
+
+/// Événement de progression temps réel émis vers le frontend via `tauri::Emitter`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FlashProgressEvent {
+    pub stage: String,
+    pub percent: f64,
+    pub speed_mbps: f64,
+    pub bytes_processed: u64,
+    pub total_bytes: u64,
+    pub eta_seconds: Option<u64>,
+    pub log: Option<String>,
+    pub completed: bool,
+    pub error: Option<String>,
+}
+
+/// Vérifie la présence d'un exécutable dans le `PATH` ou dans `/usr/sbin` / `/sbin`.
+pub fn has_command(bin: &str) -> bool {
+    if let Ok(path_var) = std::env::var("PATH") {
+        for dir in path_var.split(':').chain(["/usr/sbin", "/sbin", "/usr/bin"]) {
+            let candidate = Path::new(dir).join(bin);
+            if candidate.is_file() {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+/// Binaires `wimtools` (`wimlib-imagex` + `libwim.so.15` + `libntfs-3g.so.89`) embarqués directement
+/// dans l'exécutable Rust afin qu'aucun utilisateur Linux n'ait besoin d'installer `wimtools` manuellement.
+const EMBEDDED_WIMLIB_BIN: &[u8] = include_bytes!("../resources/wimtools/wimlib-imagex");
+const EMBEDDED_LIBWIM_SO: &[u8] = include_bytes!("../resources/wimtools/libwim.so.15");
+const EMBEDDED_LIBNTFS_SO: &[u8] = include_bytes!("../resources/wimtools/libntfs-3g.so.89");
+
+/// Extrait ou localise le binaire `wimlib-imagex` embarqué et ses bibliothèques partagées,
+/// et retourne `(chemin_wimlib_imagex, dossier_ld_library_path)`.
+pub fn ensure_embedded_wimtools() -> AppResult<(PathBuf, PathBuf)> {
+    use std::os::unix::fs::PermissionsExt;
+
+    let runtime_dir = PathBuf::from("/tmp/noos_embedded_wimtools");
+    fs::create_dir_all(&runtime_dir)?;
+
+    let bin_path = runtime_dir.join("wimlib-imagex");
+    let libwim_path = runtime_dir.join("libwim.so.15");
+    let libntfs_path = runtime_dir.join("libntfs-3g.so.89");
+
+    let needs_extract = !bin_path.exists()
+        || fs::metadata(&bin_path)
+            .map(|m| m.len() != EMBEDDED_WIMLIB_BIN.len() as u64)
+            .unwrap_or(true);
+
+    if needs_extract {
+        fs::write(&bin_path, EMBEDDED_WIMLIB_BIN)?;
+        let mut perms = fs::metadata(&bin_path)?.permissions();
+        perms.set_mode(0o755);
+        fs::set_permissions(&bin_path, perms)?;
+    }
+
+    if !libwim_path.exists() {
+        fs::write(&libwim_path, EMBEDDED_LIBWIM_SO)?;
+    }
+    if !libntfs_path.exists() {
+        fs::write(&libntfs_path, EMBEDDED_LIBNTFS_SO)?;
+    }
+
+    Ok((bin_path, runtime_dir))
+}
+
+/// Exécute `wimlib-imagex split` en utilisant prioritairement la version embarquée autonome.
+fn run_embedded_wimsplit(wim_src_str: &str, swm_dst_str: &str) -> AppResult<()> {
+    let (bin_path, lib_dir) = ensure_embedded_wimtools()?;
+    let output = Command::new(&bin_path)
+        .env("LD_LIBRARY_PATH", &lib_dir)
+        .args(["split", wim_src_str, swm_dst_str, "3800"])
+        .output()?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        let details = if !stderr.is_empty() { stderr } else { stdout };
+        return Err(AppError::CommandFailed {
+            cmd: "wimlib-imagex split (embedded)".to_string(),
+            details,
+        });
+    }
+    Ok(())
+}
+
+/// Retourne toujours un binaire de découpage WIM valide (embarqué dans l'application ou système).
+fn find_wimsplit_binary() -> Option<&'static str> {
+    Some("wimlib-imagex (embarqué)")
+}
+
+/// Vérifie les outils système disponibles sur l'hôte.
+pub fn check_system_capabilities() -> SystemCapabilities {
+    let embedded_ok = ensure_embedded_wimtools().is_ok();
+    SystemCapabilities {
+        pkexec: has_command("pkexec"),
+        lsblk: has_command("lsblk"),
+        parted: has_command("parted") || has_command("sfdisk"),
+        mkfs_vfat: has_command("mkfs.vfat"),
+        mkfs_ntfs: has_command("mkfs.ntfs"),
+        seven_zip: has_command("7z"),
+        wimlib_imagex: embedded_ok || has_command("wimlib-imagex"),
+    }
+}
+
+/// Nettoie et normalise un label de volume pour FAT32 / NTFS (max 11 caractères ASCII majuscules).
+pub fn sanitize_volume_label(raw: &str, default_label: &str) -> String {
+    let cleaned: String = raw
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric() || *c == '_' || *c == '-')
+        .map(|c| c.to_ascii_uppercase())
+        .take(11)
+        .collect();
+
+    if cleaned.is_empty() {
+        default_label.to_string()
+    } else {
+        cleaned
+    }
+}
+
+/// Inspecte les métadonnées internes d'une image ISO via `7z l -slt` sur les fichiers clés Windows/UEFI.
+fn probe_iso_entries_with_7z(iso_path: &str) -> (bool, Option<u64>, bool) {
+    if !has_command("7z") {
+        return (false, None, false);
+    }
+
+    let Ok(output) = Command::new("7z")
+        .args([
+            "l",
+            "-slt",
+            iso_path,
+            "sources/install.wim",
+            "sources/install.esd",
+            "sources/boot.wim",
+            "sources\\install.wim",
+            "sources\\install.esd",
+            "sources\\boot.wim",
+            "bootmgr.efi",
+            "efi/boot/bootx64.efi",
+        ])
+        .output()
+    else {
+        return (false, None, false);
+    };
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let mut is_windows = false;
+    let mut install_wim_size: Option<u64> = None;
+    let mut has_efi_boot = false;
+
+    let mut current_path = String::new();
+    for line in stdout.lines() {
+        let trimmed = line.trim();
+        if let Some(p) = trimmed.strip_prefix("Path = ") {
+            current_path = p.trim().replace('\\', "/").to_ascii_lowercase();
+            if current_path == "sources/install.wim"
+                || current_path == "sources/install.esd"
+                || current_path == "sources/boot.wim"
+                || current_path == "bootmgr.efi"
+            {
+                is_windows = true;
+            }
+            if current_path == "efi/boot/bootx64.efi" || current_path == "bootmgr.efi" {
+                has_efi_boot = true;
+            }
+        } else if let Some(s) = trimmed.strip_prefix("Size = ") {
+            if current_path == "sources/install.wim" {
+                if let Ok(sz) = s.trim().parse::<u64>() {
+                    install_wim_size = Some(sz);
+                }
+            }
+        }
+    }
+
+    (is_windows, install_wim_size, has_efi_boot)
+}
+
+/// Inspecte un fichier `.iso` ou `.img` pour détecter son format (Linux Hybrid ISO vs Windows UEFI ISO).
+pub fn inspect_iso_file(iso_path: &str) -> AppResult<IsoInspection> {
+    let trimmed_path = iso_path.trim();
+    let path_obj = Path::new(trimmed_path);
+
+    if !path_obj.exists() || !path_obj.is_file() {
+        return Err(AppError::InvalidIso(format!(
+            "Le fichier '{}' est introuvable.",
+            trimmed_path
+        )));
+    }
+
+    let file_name = path_obj
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("image.iso")
+        .to_string();
+
+    let ext = path_obj
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("")
+        .to_ascii_lowercase();
+
+    if ext != "iso" && ext != "img" {
+        return Err(AppError::InvalidIso(format!(
+            "Extension '.{ext}' non supportée. Veuillez sélectionner un fichier .iso ou .img."
+        )));
+    }
+
+    let metadata = fs::metadata(path_obj)?;
+    let size_bytes = metadata.len();
+    if size_bytes < 1024 * 1024 {
+        return Err(AppError::InvalidIso(
+            "Le fichier image est trop petit (< 1 Mio) ou corrompu.".to_string(),
+        ));
+    }
+
+    let mut file = File::open(path_obj)?;
+
+    // 1. Lecture du secteur 0 (MBR) et secteur 1 (GPT Header)
+    let mut head_buf = [0u8; 1024];
+    let head_read = file.read(&mut head_buf)?;
+    let has_mbr_sig = head_read >= 512 && head_buf[510] == 0x55 && head_buf[511] == 0xAA;
+    let has_part_entries = head_read >= 512 && head_buf[446..510].iter().any(|&b| b != 0);
+    let is_hybrid_mbr = has_mbr_sig && has_part_entries;
+    let has_gpt_header = head_read >= 520 && &head_buf[512..520] == b"EFI PART";
+
+    // 2. Lecture des descripteurs ISO 9660 / El Torito / UDF aux secteurs 16..20 (offset 0x8000)
+    let mut is_iso9660 = false;
+    let mut is_udf = false;
+    let mut has_el_torito = false;
+    let mut raw_volume_label = String::new();
+
+    if size_bytes >= 0xA000 && file.seek(SeekFrom::Start(0x8000)).is_ok() {
+        let mut pvd_buf = [0u8; 8192];
+        if file.read_exact(&mut pvd_buf).is_ok() {
+            for sector in pvd_buf.chunks_exact(2048) {
+                let ident = &sector[1..6];
+                if ident == b"CD001" {
+                    is_iso9660 = true;
+                    if sector[0] == 1 && raw_volume_label.is_empty() {
+                        raw_volume_label = String::from_utf8_lossy(&sector[40..72])
+                            .trim()
+                            .to_string();
+                    } else if sector[0] == 0 && sector[7..30].starts_with(b"EL TORITO SPECIFICATION")
+                    {
+                        has_el_torito = true;
+                    }
+                } else if ident == b"BEA01" || ident == b"NSR02" || ident == b"NSR03" {
+                    is_udf = true;
+                }
+            }
+        }
+    }
+
+    // 3. Inspection rapide de la structure interne Windows/UEFI via 7z + heuristiques de nom/label
+    let (probed_win, install_wim_size, _has_efi) = probe_iso_entries_with_7z(trimmed_path);
+
+    let lower_name = file_name.to_ascii_lowercase();
+    let lower_label = raw_volume_label.to_ascii_lowercase();
+    let heuristic_win = lower_name.contains("win10")
+        || lower_name.contains("win11")
+        || lower_name.contains("windows")
+        || lower_label.contains("cccoma")
+        || lower_label.contains("esd-iso")
+        || lower_label.contains("win10")
+        || lower_label.contains("win11");
+
+    let is_windows_iso = probed_win || (is_udf && heuristic_win && !is_hybrid_mbr);
+    let wimlib_available = find_wimsplit_binary().is_some();
+    let requires_wim_split_for_fat32 = install_wim_size
+        .map(|sz| sz > FAT32_MAX_FILE_SIZE)
+        .unwrap_or(is_windows_iso && size_bytes > 4_600_000_000);
+
+    let (kind, kind_label, recommended_mode, default_label) = if ext == "img" {
+        (
+            IsoKind::RawImage,
+            "Image Disque Brute (.img)".to_string(),
+            FlashMode::LinuxDd,
+            "NOOS_IMG",
+        )
+    } else if is_windows_iso {
+        (
+            IsoKind::WindowsUefi,
+            "ISO Windows UEFI (UDF / Boot Manager)".to_string(),
+            FlashMode::WindowsUefi,
+            "WIN_USB",
+        )
+    } else if is_hybrid_mbr || has_gpt_header {
+        (
+            IsoKind::LinuxHybrid,
+            "ISO Linux Hybride (isohybrid MBR/GPT)".to_string(),
+            FlashMode::LinuxDd,
+            "LINUX_USB",
+        )
+    } else if is_iso9660 || is_udf {
+        (
+            IsoKind::StandardIso,
+            "Image ISO 9660 / UDF Standard".to_string(),
+            FlashMode::LinuxDd,
+            "BOOT_USB",
+        )
+    } else {
+        return Err(AppError::InvalidIso(
+            "Signature ISO 9660, UDF ou MBR introuvable dans l'image sélectionnée.".to_string(),
+        ));
+    };
+
+    let volume_label = sanitize_volume_label(&raw_volume_label, default_label);
+    let install_wim_formatted = install_wim_size.map(format_size);
+
+    // Si install.wim > 4 Gio et que wimlib est présent, on peut utiliser FAT32 (avec split wimlib)
+    // ou NTFS directement. Si wimlib est absent, on recommande NTFS par défaut.
+    let recommended_fs = if is_windows_iso && requires_wim_split_for_fat32 && !wimlib_available {
+        FileSystemType::Ntfs
+    } else {
+        FileSystemType::Fat32
+    };
+
+    let details = match kind {
+        IsoKind::WindowsUefi => {
+            if let Some(ref wim_fmt) = install_wim_formatted {
+                if requires_wim_split_for_fat32 {
+                    format!(
+                        "Installateur Windows détecté (install.wim : {wim_fmt} > 4 Gio). En FAT32, découpage automatique via wimlib ; en NTFS, copie directe."
+                    )
+                } else {
+                    format!("Installateur Windows détecté (install.wim : {wim_fmt} < 4 Gio). Compatible FAT32 et NTFS.")
+                }
+            } else {
+                "Installateur Windows UEFI détecté. Partitionnement GPT/MBR et extraction des fichiers d'amorçage.".to_string()
+            }
+        }
+        IsoKind::LinuxHybrid => {
+            "Image ISO Linux hybride dotée d'une table de partition amorçable. Écriture directe par blocs (mode DD) recommandée.".to_string()
+        }
+        IsoKind::RawImage => {
+            "Image disque brute (.img). Écriture directe bloc à bloc (mode DD) sur le périphérique cible.".to_string()
+        }
+        IsoKind::StandardIso => {
+            "Image ISO 9660 standard détectée. Écriture directe (mode DD) sélectionnée.".to_string()
+        }
+    };
+
+    Ok(IsoInspection {
+        path: trimmed_path.to_string(),
+        file_name,
+        size_bytes,
+        size_formatted: format_size(size_bytes),
+        kind,
+        kind_label,
+        volume_label,
+        is_hybrid_mbr,
+        has_gpt_header,
+        has_el_torito,
+        is_udf,
+        is_windows_iso,
+        install_wim_size,
+        install_wim_formatted,
+        requires_wim_split_for_fat32,
+        wimlib_available,
+        recommended_mode,
+        recommended_scheme: PartitionScheme::Gpt,
+        recommended_fs,
+        details,
+    })
+}
+
+/// Lance le processus de flashage en tâche de fond via `pkexec` et relaie la progression temps réel au frontend Tauri.
+pub async fn execute_flash_with_pkexec(
+    app: AppHandle,
+    config: FlashJobConfig,
+    cancel_flag: Arc<AtomicBool>,
+) -> AppResult<()> {
+    // 1. Validation de sécurité côté utilisateur avant même d'appeler pkexec
+    let validated_drive = validate_target_device(&config.device_path)?;
+    let inspected_iso = inspect_iso_file(&config.iso_path)?;
+
+    if inspected_iso.size_bytes > validated_drive.size_bytes {
+        return Err(AppError::InvalidIso(format!(
+            "L'image ({}) est plus volumineuse que la clé USB sélectionnée ({}).",
+            inspected_iso.size_formatted, validated_drive.size_formatted
+        )));
+    }
+
+    if config.mode == FlashMode::WindowsUefi
+        && config.fs_type == FileSystemType::Fat32
+        && inspected_iso.requires_wim_split_for_fat32
+        && !inspected_iso.wimlib_available
+    {
+        return Err(AppError::WimSplitRequired(
+            "Le fichier install.wim dépasse la limite FAT32 de 4 Gio et l'outil 'wimlib-imagex' (paquet wimtools) n'est pas installé sur ce système. Sélectionnez le format NTFS ou installez 'sudo apt install wimtools'.".to_string(),
+        ));
+    }
+
+    let current_exe = std::env::current_exe()?;
+    let exe_str = current_exe.to_str().ok_or_else(|| {
+        AppError::Other(anyhow::anyhow!(
+            "Le chemin de l'exécutable contient des caractères UTF-8 invalides"
+        ))
+    })?;
+
+    let safe_label = sanitize_volume_label(&config.volume_label, "NOOS_USB");
+    let normalized_job = FlashJobConfig {
+        device_path: validated_drive.path.clone(),
+        iso_path: inspected_iso.path.clone(),
+        mode: config.mode,
+        partition_scheme: config.partition_scheme,
+        fs_type: config.fs_type,
+        volume_label: safe_label.clone(),
+        windows_custom: config.windows_custom.clone(),
+    };
+    let job_json = serde_json::to_string(&normalized_job)?;
+
+    let _ = app.emit(
+        "flash-progress",
+        FlashProgressEvent {
+            stage: "Demande d'élévation de privilèges PolicyKit (pkexec)...".to_string(),
+            percent: 0.0,
+            speed_mbps: 0.0,
+            bytes_processed: 0,
+            total_bytes: inspected_iso.size_bytes,
+            eta_seconds: None,
+            log: Some(format!(
+                "Authentification Polkit requise pour écrire sur {} ({} {})",
+                validated_drive.path, validated_drive.vendor, validated_drive.model
+            )),
+            completed: false,
+            error: None,
+        },
+    );
+
+    // 2. Exécution sécurisée sans sous-shell (zéro bash -c) via pkexec vers notre propre binaire en mode worker
+    let mut child = tokio::process::Command::new("pkexec")
+        .args([exe_str, "--privileged-worker", "--job-json", &job_json])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|e| {
+            AppError::PrivilegeElevationDenied(format!("Impossible de lancer pkexec : {e}"))
+        })?;
+
+    let stdout = child.stdout.take().ok_or_else(|| {
+        AppError::Other(anyhow::anyhow!(
+            "Impossible de capturer le flux stdout du worker privilégié"
+        ))
+    })?;
+    let stderr = child.stderr.take().ok_or_else(|| {
+        AppError::Other(anyhow::anyhow!(
+            "Impossible de capturer le flux stderr du worker privilégié"
+        ))
+    })?;
+
+    let mut stdout_lines = BufReader::new(stdout).lines();
+    let mut stderr_lines = BufReader::new(stderr).lines();
+    let mut last_error_msg = String::new();
+
+    loop {
+        if cancel_flag.load(Ordering::Relaxed) {
+            let _ = child.kill().await;
+            return Err(AppError::Cancelled);
+        }
+
+        tokio::select! {
+            line_res = stdout_lines.next_line() => {
+                match line_res {
+                    Ok(Some(line)) => {
+                        if let Some(json_str) = line.strip_prefix(PROGRESS_PREFIX) {
+                            if let Ok(event) = serde_json::from_str::<FlashProgressEvent>(json_str) {
+                                if let Some(ref err) = event.error {
+                                    last_error_msg = err.clone();
+                                }
+                                let _ = app.emit("flash-progress", event);
+                            }
+                        } else if !line.trim().is_empty() {
+                            let _ = app.emit(
+                                "flash-progress",
+                                FlashProgressEvent {
+                                    stage: "Opération en cours...".to_string(),
+                                    percent: 0.0,
+                                    speed_mbps: 0.0,
+                                    bytes_processed: 0,
+                                    total_bytes: inspected_iso.size_bytes,
+                                    eta_seconds: None,
+                                    log: Some(line),
+                                    completed: false,
+                                    error: None,
+                                },
+                            );
+                        }
+                    }
+                    Ok(None) => break,
+                    Err(e) => {
+                        last_error_msg = format!("Erreur de lecture du flux worker : {e}");
+                        break;
+                    }
+                }
+            }
+            err_res = stderr_lines.next_line() => {
+                if let Ok(Some(err_line)) = err_res {
+                    let trimmed = err_line.trim();
+                    if !trimmed.is_empty() {
+                        last_error_msg = trimmed.to_string();
+                    }
+                }
+            }
+            _ = tokio::time::sleep(Duration::from_millis(200)) => {
+                if cancel_flag.load(Ordering::Relaxed) {
+                    let _ = child.kill().await;
+                    return Err(AppError::Cancelled);
+                }
+            }
+        }
+    }
+
+    let status = child.wait().await?;
+    if !status.success() {
+        let code = status.code().unwrap_or(-1);
+        if code == 126 || code == 127 {
+            return Err(AppError::PrivilegeElevationDenied(
+                "Authentification PolicyKit annulée ou refusée.".to_string(),
+            ));
+        }
+        let reason = if last_error_msg.is_empty() {
+            format!("Le worker privilégié s'est terminé avec le code {code}")
+        } else {
+            last_error_msg
+        };
+        return Err(AppError::CommandFailed {
+            cmd: "privileged-worker".to_string(),
+            details: reason,
+        });
+    }
+
+    Ok(())
+}
+
+// ============================================================================
+// LOGIQUE DU WORKER PRIVILÉGIÉ (EXÉCUTÉ EN ROOT VIA PKEXEC)
+// ============================================================================
+
+/// Émet un événement JSON structuré sur `stdout` à destination du processus Tauri parent.
+fn emit_worker_event(event: &FlashProgressEvent) {
+    if let Ok(serialized) = serde_json::to_string(event) {
+        println!("{PROGRESS_PREFIX}{serialized}");
+        let _ = std::io::stdout().flush();
+    }
+}
+
+/// Point d'entrée du mode `--privileged-worker` invoqué par `pkexec`.
+pub fn run_privileged_worker_from_args(args: &[String]) -> i32 {
+    match parse_and_run_worker(args) {
+        Ok(()) => 0,
+        Err(err) => {
+            emit_worker_event(&FlashProgressEvent {
+                stage: "Erreur critique".to_string(),
+                percent: 0.0,
+                speed_mbps: 0.0,
+                bytes_processed: 0,
+                total_bytes: 0,
+                eta_seconds: None,
+                log: Some(format!("ERREUR : {err}")),
+                completed: false,
+                error: Some(err.to_string()),
+            });
+            eprintln!("{err}");
+            1
+        }
+    }
+}
+
+fn parse_and_run_worker(args: &[String]) -> AppResult<()> {
+    let mut job_json_opt: Option<String> = None;
+    let mut device_path = None;
+    let mut iso_path = None;
+    let mut mode = FlashMode::LinuxDd;
+    let mut partition_scheme = PartitionScheme::Gpt;
+    let mut fs_type = FileSystemType::Fat32;
+    let mut volume_label = "NOOS_USB".to_string();
+
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--job-json" => {
+                i += 1;
+                if let Some(v) = args.get(i) {
+                    job_json_opt = Some(v.clone());
+                }
+            }
+            "--device" => {
+                i += 1;
+                if let Some(v) = args.get(i) {
+                    device_path = Some(v.clone());
+                }
+            }
+            "--iso" => {
+                i += 1;
+                if let Some(v) = args.get(i) {
+                    iso_path = Some(v.clone());
+                }
+            }
+            "--mode" => {
+                i += 1;
+                if let Some(v) = args.get(i) {
+                    mode = FlashMode::from_arg(v)?;
+                }
+            }
+            "--scheme" => {
+                i += 1;
+                if let Some(v) = args.get(i) {
+                    partition_scheme = PartitionScheme::from_arg(v)?;
+                }
+            }
+            "--fs" => {
+                i += 1;
+                if let Some(v) = args.get(i) {
+                    fs_type = FileSystemType::from_arg(v)?;
+                }
+            }
+            "--label" => {
+                i += 1;
+                if let Some(v) = args.get(i) {
+                    volume_label = sanitize_volume_label(v, "NOOS_USB");
+                }
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+
+    let mut config = if let Some(json_str) = job_json_opt {
+        serde_json::from_str::<FlashJobConfig>(&json_str)?
+    } else {
+        let dev = device_path.ok_or_else(|| {
+            AppError::Other(anyhow::anyhow!(
+                "Argument --device manquant pour le worker privilégié"
+            ))
+        })?;
+        let iso = iso_path.ok_or_else(|| {
+            AppError::Other(anyhow::anyhow!(
+                "Argument --iso manquant pour le worker privilégié"
+            ))
+        })?;
+        FlashJobConfig {
+            device_path: dev,
+            iso_path: iso,
+            mode,
+            partition_scheme,
+            fs_type,
+            volume_label,
+            windows_custom: None,
+        }
+    };
+
+    // Double vérification de sécurité du périphérique cible dans le processus root
+    let drive = validate_target_device(&config.device_path)?;
+    config.device_path = drive.path.clone();
+    config.volume_label = sanitize_volume_label(&config.volume_label, "NOOS_USB");
+
+    match config.mode {
+        FlashMode::LinuxDd => run_linux_dd_flash(&config, &drive.partitions),
+        FlashMode::WindowsUefi => run_windows_uefi_flash(&config, &drive.partitions),
+    }
+}
+
+/// Démonte proprement toutes les partitions montées d'un périphérique USB.
+fn unmount_all_device_partitions(
+    device_path: &str,
+    partitions: &[crate::drive::DrivePartition],
+) -> AppResult<()> {
+    emit_worker_event(&FlashProgressEvent {
+        stage: "Démontage des partitions existantes...".to_string(),
+        percent: 1.0,
+        speed_mbps: 0.0,
+        bytes_processed: 0,
+        total_bytes: 0,
+        eta_seconds: None,
+        log: Some(format!(
+            "Vérification et démontage des volumes montés sur {device_path}..."
+        )),
+        completed: false,
+        error: None,
+    });
+
+    for part in partitions {
+        if part.mountpoint.is_some() {
+            let _ = Command::new("umount").arg(&part.path).status();
+            let _ = Command::new("umount").args(["-l", &part.path]).status();
+        }
+    }
+
+    // Démontage éventuel du périphérique bloc racine s'il était monté en direct (ex: iso9660)
+    let _ = Command::new("umount").arg(device_path).status();
+    Ok(())
+}
+
+/// Écriture brute bloc par bloc (mode `dd`) avec calcul de vitesse en temps réel et `sync`.
+fn run_linux_dd_flash(
+    config: &FlashJobConfig,
+    partitions: &[crate::drive::DrivePartition],
+) -> AppResult<()> {
+    unmount_all_device_partitions(&config.device_path, partitions)?;
+
+    let mut src_file = File::open(&config.iso_path)?;
+    let total_bytes = src_file.metadata()?.len();
+
+    emit_worker_event(&FlashProgressEvent {
+        stage: "Ouverture du périphérique bloc en écriture directe...".to_string(),
+        percent: 2.0,
+        speed_mbps: 0.0,
+        bytes_processed: 0,
+        total_bytes,
+        eta_seconds: None,
+        log: Some(format!(
+            "Début du flashage DD de '{}' ({}) vers '{}'",
+            config.iso_path,
+            format_size(total_bytes),
+            config.device_path
+        )),
+        completed: false,
+        error: None,
+    });
+
+    let mut dst_device = OpenOptions::new().write(true).open(&config.device_path)?;
+
+    // Tampon de streaming de 4 Mio
+    const CHUNK_SIZE: usize = 4 * 1024 * 1024;
+    const SYNC_INTERVAL_BYTES: u64 = 32 * 1024 * 1024;
+
+    let mut buffer = vec![0u8; CHUNK_SIZE];
+    let mut bytes_written: u64 = 0;
+    let mut bytes_since_last_sync: u64 = 0;
+    let start_time = Instant::now();
+    let mut last_emit = Instant::now();
+
+    loop {
+        let read_count = src_file.read(&mut buffer)?;
+        if read_count == 0 {
+            break;
+        }
+
+        dst_device.write_all(&buffer[..read_count])?;
+        bytes_written += read_count as u64;
+        bytes_since_last_sync += read_count as u64;
+
+        // Synchronisation périodique pour éviter l'accumulation dans le cache RAM du noyau
+        // et fournir une mesure de vitesse matérielle réelle.
+        if bytes_since_last_sync >= SYNC_INTERVAL_BYTES {
+            dst_device.sync_data()?;
+            bytes_since_last_sync = 0;
+        }
+
+        let now = Instant::now();
+        if now.duration_since(last_emit) >= Duration::from_millis(120)
+            || bytes_written == total_bytes
+        {
+            let elapsed_secs = start_time.elapsed().as_secs_f64().max(0.001);
+            let speed_mbps = (bytes_written as f64 / (1024.0 * 1024.0)) / elapsed_secs;
+            let raw_ratio = (bytes_written as f64 / total_bytes.max(1) as f64).clamp(0.0, 1.0);
+            // Plage 2% -> 95% pour l'écriture, 95% -> 100% pour le sync final
+            let percent = 2.0 + raw_ratio * 93.0;
+
+            let remaining_bytes = total_bytes.saturating_sub(bytes_written);
+            let bytes_per_sec = bytes_written as f64 / elapsed_secs;
+            let eta_seconds = if bytes_per_sec > 1024.0 {
+                Some((remaining_bytes as f64 / bytes_per_sec) as u64)
+            } else {
+                None
+            };
+
+            emit_worker_event(&FlashProgressEvent {
+                stage: "Écriture brute de l'image ISO (mode DD)...".to_string(),
+                percent,
+                speed_mbps,
+                bytes_processed: bytes_written,
+                total_bytes,
+                eta_seconds,
+                log: None,
+                completed: false,
+                error: None,
+            });
+            last_emit = now;
+        }
+    }
+
+    emit_worker_event(&FlashProgressEvent {
+        stage: "Synchronisation matérielle des caches (sync)...".to_string(),
+        percent: 96.0,
+        speed_mbps: 0.0,
+        bytes_processed: bytes_written,
+        total_bytes,
+        eta_seconds: Some(2),
+        log: Some("Vidage des tampons d'écriture du noyau Linux (fsync + sync)...".to_string()),
+        completed: false,
+        error: None,
+    });
+
+    dst_device.sync_all()?;
+    drop(dst_device);
+    nix::unistd::sync();
+
+    let _ = Command::new("partprobe").arg(&config.device_path).status();
+    let _ = Command::new("udevadm").arg("settle").status();
+
+    let total_elapsed = start_time.elapsed().as_secs_f64().max(0.001);
+    let avg_speed = (bytes_written as f64 / (1024.0 * 1024.0)) / total_elapsed;
+
+    emit_worker_event(&FlashProgressEvent {
+        stage: "Clé USB bootable créée avec succès !".to_string(),
+        percent: 100.0,
+        speed_mbps: avg_speed,
+        bytes_processed: bytes_written,
+        total_bytes,
+        eta_seconds: Some(0),
+        log: Some(format!(
+            "Flashage DD terminé avec succès : {} écrits à {:.1} Mo/s de moyenne.",
+            format_size(bytes_written),
+            avg_speed
+        )),
+        completed: true,
+        error: None,
+    });
+
+    Ok(())
+}
+
+/// Garde RAII assurant le démontage et la suppression des dossiers temporaires en fin d'opération.
+struct MountCleanupGuard {
+    usb_mnt: PathBuf,
+    iso_mnt: PathBuf,
+}
+
+impl Drop for MountCleanupGuard {
+    fn drop(&mut self) {
+        let _ = Command::new("umount").arg(&self.usb_mnt).status();
+        let _ = Command::new("umount").args(["-l", &self.usb_mnt.to_string_lossy()]).status();
+        let _ = Command::new("umount").arg(&self.iso_mnt).status();
+        let _ = Command::new("umount").args(["-l", &self.iso_mnt.to_string_lossy()]).status();
+        let _ = fs::remove_dir(&self.usb_mnt);
+        let _ = fs::remove_dir(&self.iso_mnt);
+    }
+}
+
+/// Exécute une commande système avec arguments vectorisés et retourne une erreur typée en cas d'échec.
+fn run_checked_command(bin: &str, args: &[&str]) -> AppResult<()> {
+    let output = Command::new(bin).args(args).output()?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        let details = if !stderr.is_empty() { stderr } else { stdout };
+        return Err(AppError::CommandFailed {
+            cmd: format!("{bin} {}", args.join(" ")),
+            details,
+        });
+    }
+    Ok(())
+}
+
+/// Préparation complète d'une clé USB Windows UEFI :
+/// Partitionnement GPT/MBR -> Formatage FAT32/NTFS -> Extraction -> Découpage `install.wim` (si FAT32 > 4 Gio).
+fn run_windows_uefi_flash(
+    config: &FlashJobConfig,
+    partitions: &[crate::drive::DrivePartition],
+) -> AppResult<()> {
+    let total_iso_bytes = fs::metadata(&config.iso_path)?.len();
+
+    // 1. Démontage et nettoyage des signatures existantes
+    unmount_all_device_partitions(&config.device_path, partitions)?;
+
+    emit_worker_event(&FlashProgressEvent {
+        stage: "Effacement des signatures de partition existantes...".to_string(),
+        percent: 3.0,
+        speed_mbps: 0.0,
+        bytes_processed: 0,
+        total_bytes: total_iso_bytes,
+        eta_seconds: None,
+        log: Some(format!("Exécution de wipefs -a sur {}", config.device_path)),
+        completed: false,
+        error: None,
+    });
+
+    if has_command("wipefs") {
+        let _ = run_checked_command("wipefs", &["-a", &config.device_path]);
+    }
+
+    // 2. Partitionnement GPT ou MBR via parted
+    let scheme_label = match config.partition_scheme {
+        PartitionScheme::Gpt => "gpt",
+        PartitionScheme::Mbr => "msdos",
+    };
+    let parted_fs = match config.fs_type {
+        FileSystemType::Fat32 => "fat32",
+        FileSystemType::Ntfs => "ntfs",
+    };
+
+    emit_worker_event(&FlashProgressEvent {
+        stage: format!(
+            "Partitionnement {} ({})...",
+            config.partition_scheme.as_str().to_uppercase(),
+            config.fs_type.as_str().to_uppercase()
+        ),
+        percent: 6.0,
+        speed_mbps: 0.0,
+        bytes_processed: 0,
+        total_bytes: total_iso_bytes,
+        eta_seconds: None,
+        log: Some(format!(
+            "Création de la table de partitions {} et de la partition principale sur {}...",
+            scheme_label.to_uppercase(),
+            config.device_path
+        )),
+        completed: false,
+        error: None,
+    });
+
+    run_checked_command("parted", &["-s", &config.device_path, "mklabel", scheme_label])?;
+    run_checked_command(
+        "parted",
+        &[
+            "-s",
+            &config.device_path,
+            "mkpart",
+            "primary",
+            parted_fs,
+            "1MiB",
+            "100%",
+        ],
+    )?;
+
+    match config.partition_scheme {
+        PartitionScheme::Gpt => {
+            if config.fs_type == FileSystemType::Fat32 {
+                let _ = run_checked_command("parted", &["-s", &config.device_path, "set", "1", "esp", "on"]);
+            } else {
+                let _ = run_checked_command(
+                    "parted",
+                    &["-s", &config.device_path, "set", "1", "msftdata", "on"],
+                );
+            }
+        }
+        PartitionScheme::Mbr => {
+            let _ = run_checked_command("parted", &["-s", &config.device_path, "set", "1", "boot", "on"]);
+        }
+    }
+
+    let _ = Command::new("partprobe").arg(&config.device_path).status();
+    let _ = Command::new("udevadm").arg("settle").status();
+
+    let part_path = partition_path_for_disk(&config.device_path, 1);
+    for _ in 0..25 {
+        if Path::new(&part_path).exists() {
+            break;
+        }
+        thread::sleep(Duration::from_millis(200));
+    }
+
+    if !Path::new(&part_path).exists() {
+        return Err(AppError::DeviceNotFound(format!(
+            "La partition nouvellement créée '{part_path}' n'est pas apparue dans /dev."
+        )));
+    }
+
+    // 3. Formatage FAT32 ou NTFS
+    emit_worker_event(&FlashProgressEvent {
+        stage: format!(
+            "Formatage de {} en {}...",
+            part_path,
+            config.fs_type.as_str().to_uppercase()
+        ),
+        percent: 12.0,
+        speed_mbps: 0.0,
+        bytes_processed: 0,
+        total_bytes: total_iso_bytes,
+        eta_seconds: None,
+        log: Some(format!(
+            "Formatage du système de fichiers {} (Label: {}) sur {}...",
+            config.fs_type.as_str().to_uppercase(),
+            config.volume_label,
+            part_path
+        )),
+        completed: false,
+        error: None,
+    });
+
+    match config.fs_type {
+        FileSystemType::Fat32 => {
+            run_checked_command(
+                "mkfs.vfat",
+                &["-F", "32", "-n", &config.volume_label, &part_path],
+            )?;
+        }
+        FileSystemType::Ntfs => {
+            run_checked_command(
+                "mkfs.ntfs",
+                &["-Q", "-L", &config.volume_label, &part_path],
+            )?;
+        }
+    }
+
+    // 4. Montage de l'ISO et de la partition USB
+    let pid = std::process::id();
+    let iso_mnt = PathBuf::from(format!("/tmp/noos_win_iso_{pid}"));
+    let usb_mnt = PathBuf::from(format!("/tmp/noos_win_usb_{pid}"));
+    fs::create_dir_all(&iso_mnt)?;
+    fs::create_dir_all(&usb_mnt)?;
+
+    let _cleanup_guard = MountCleanupGuard {
+        usb_mnt: usb_mnt.clone(),
+        iso_mnt: iso_mnt.clone(),
+    };
+
+    let iso_mnt_str = iso_mnt.to_str().ok_or_else(|| {
+        AppError::Other(anyhow::anyhow!("Chemin temporaire ISO invalide"))
+    })?;
+    let usb_mnt_str = usb_mnt.to_str().ok_or_else(|| {
+        AppError::Other(anyhow::anyhow!("Chemin temporaire USB invalide"))
+    })?;
+
+    emit_worker_event(&FlashProgressEvent {
+        stage: "Montage de l'image ISO et du volume USB...".to_string(),
+        percent: 16.0,
+        speed_mbps: 0.0,
+        bytes_processed: 0,
+        total_bytes: total_iso_bytes,
+        eta_seconds: None,
+        log: Some(format!(
+            "Montage loop de l'ISO sur {iso_mnt_str} et de {part_path} sur {usb_mnt_str}"
+        )),
+        completed: false,
+        error: None,
+    });
+
+    run_checked_command("mount", &["-o", "loop,ro", &config.iso_path, iso_mnt_str])?;
+    run_checked_command("mount", &[&part_path, usb_mnt_str])?;
+
+    // 5. Inspection des fichiers à copier et détection d'un éventuel install.wim > 4 Gio en FAT32
+    let mut files_to_copy: Vec<(PathBuf, PathBuf, u64)> = Vec::new();
+    let mut split_wim_source: Option<(PathBuf, u64)> = None;
+    let mut total_copy_bytes: u64 = 0;
+
+    for entry_res in WalkDir::new(&iso_mnt).follow_links(false) {
+        let entry = entry_res.map_err(|e| AppError::Other(anyhow::anyhow!("Erreur WalkDir: {e}")))?;
+        let src_path = entry.path();
+        let rel_path = src_path
+            .strip_prefix(&iso_mnt)
+            .map_err(|e| AppError::Other(anyhow::anyhow!("Erreur strip_prefix: {e}")))?;
+
+        if rel_path.as_os_str().is_empty() {
+            continue;
+        }
+
+        let dst_path = usb_mnt.join(rel_path);
+        if entry.file_type().is_dir() {
+            fs::create_dir_all(&dst_path)?;
+        } else if entry.file_type().is_file() {
+            let file_len = entry.metadata().map(|m| m.len()).unwrap_or(0);
+            let rel_lower = rel_path.to_string_lossy().replace('\\', "/").to_ascii_lowercase();
+
+            if config.fs_type == FileSystemType::Fat32
+                && rel_lower == "sources/install.wim"
+                && file_len > FAT32_MAX_FILE_SIZE
+            {
+                split_wim_source = Some((src_path.to_path_buf(), file_len));
+            } else {
+                total_copy_bytes += file_len;
+                files_to_copy.push((src_path.to_path_buf(), dst_path, file_len));
+            }
+        }
+    }
+
+    if split_wim_source.is_some() && find_wimsplit_binary().is_none() {
+        return Err(AppError::WimSplitRequired(
+            "install.wim dépasse 4 Gio sur une partition FAT32 et 'wimlib-imagex' est introuvable. Installez 'wimtools' ou choisissez NTFS.".to_string(),
+        ));
+    }
+
+    // 6. Copie streamée des fichiers de l'ISO avec vitesse Mo/s et progression temps réel
+    let copy_progress_span = if split_wim_source.is_some() {
+        62.0 // 18% -> 80% pour la copie, puis 80% -> 95% pour le split WIM
+    } else {
+        77.0 // 18% -> 95% pour la copie complète
+    };
+
+    let mut copied_bytes: u64 = 0;
+    let start_copy = Instant::now();
+    let mut last_emit = Instant::now();
+    let mut copy_buf = vec![0u8; 1024 * 1024]; // 1 Mio
+
+    for (src_file_path, dst_file_path, _file_len) in &files_to_copy {
+        if let Some(parent) = dst_file_path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+
+        let rel_display = src_file_path
+            .strip_prefix(&iso_mnt)
+            .map(|p| p.to_string_lossy().to_string())
+            .unwrap_or_else(|_| src_file_path.to_string_lossy().to_string());
+
+        let is_notable_file = {
+            let low = rel_display.to_ascii_lowercase();
+            low.ends_with("boot.wim")
+                || low.ends_with("install.wim")
+                || low.ends_with("install.esd")
+                || low.ends_with("bootx64.efi")
+                || low.ends_with("bootmgr.efi")
+        };
+
+        if is_notable_file {
+            let elapsed = start_copy.elapsed().as_secs_f64().max(0.001);
+            let speed = (copied_bytes as f64 / (1024.0 * 1024.0)) / elapsed;
+            let ratio = (copied_bytes as f64 / total_copy_bytes.max(1) as f64).clamp(0.0, 1.0);
+            emit_worker_event(&FlashProgressEvent {
+                stage: format!("Extraction : {rel_display}"),
+                percent: 18.0 + ratio * copy_progress_span,
+                speed_mbps: speed,
+                bytes_processed: copied_bytes,
+                total_bytes: total_iso_bytes,
+                eta_seconds: None,
+                log: Some(format!("Copie du fichier système : {rel_display}")),
+                completed: false,
+                error: None,
+            });
+        }
+
+        let mut reader = File::open(src_file_path)?;
+        let mut writer = File::create(dst_file_path)?;
+
+        loop {
+            let n = reader.read(&mut copy_buf)?;
+            if n == 0 {
+                break;
+            }
+            writer.write_all(&copy_buf[..n])?;
+            copied_bytes += n as u64;
+
+            let now = Instant::now();
+            if now.duration_since(last_emit) >= Duration::from_millis(150) {
+                let elapsed = start_copy.elapsed().as_secs_f64().max(0.001);
+                let speed_mbps = (copied_bytes as f64 / (1024.0 * 1024.0)) / elapsed;
+                let ratio = (copied_bytes as f64 / total_copy_bytes.max(1) as f64).clamp(0.0, 1.0);
+                let percent = 18.0 + ratio * copy_progress_span;
+
+                let rem = total_copy_bytes.saturating_sub(copied_bytes);
+                let bps = copied_bytes as f64 / elapsed;
+                let eta = if bps > 1024.0 {
+                    Some((rem as f64 / bps) as u64)
+                } else {
+                    None
+                };
+
+                emit_worker_event(&FlashProgressEvent {
+                    stage: format!("Copie des fichiers Windows ({rel_display})..."),
+                    percent,
+                    speed_mbps,
+                    bytes_processed: copied_bytes,
+                    total_bytes: total_iso_bytes,
+                    eta_seconds: eta,
+                    log: None,
+                    completed: false,
+                    error: None,
+                });
+                last_emit = now;
+            }
+        }
+    }
+
+    // 7. Découpage de install.wim via wimlib si FAT32 et fichier > 4 Gio
+    if let Some((wim_src_path, wim_size)) = split_wim_source {
+        let wim_bin = find_wimsplit_binary().ok_or_else(|| {
+            AppError::WimSplitRequired(
+                "Binaire 'wimlib-imagex' ou 'wimsplit' introuvable.".to_string(),
+            )
+        })?;
+
+        let swm_dst_path = usb_mnt.join("sources").join("install.swm");
+        if let Some(parent) = swm_dst_path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+
+        emit_worker_event(&FlashProgressEvent {
+            stage: "Découpage de install.wim (> 4 Gio) via wimlib pour FAT32...".to_string(),
+            percent: 82.0,
+            speed_mbps: 0.0,
+            bytes_processed: copied_bytes,
+            total_bytes: total_iso_bytes,
+            eta_seconds: None,
+            log: Some(format!(
+                "Découpage de {} ({}) en volumes .swm de 3800 Mio max via {wim_bin}...",
+                wim_src_path.display(),
+                format_size(wim_size)
+            )),
+            completed: false,
+            error: None,
+        });
+
+        let wim_src_str = wim_src_path.to_str().ok_or_else(|| {
+            AppError::Other(anyhow::anyhow!("Chemin install.wim invalide"))
+        })?;
+        let swm_dst_str = swm_dst_path.to_str().ok_or_else(|| {
+            AppError::Other(anyhow::anyhow!("Chemin install.swm invalide"))
+        })?;
+
+        run_embedded_wimsplit(wim_src_str, swm_dst_str)?;
+
+        copied_bytes += wim_size;
+    }
+
+    // 7b. Déploiement de autounattend.xml (Compte local Windows) et des scripts PowerShell Debloat ($OEM$)
+    if let Some(ref win_custom) = config.windows_custom {
+        if win_custom.enabled {
+            emit_worker_event(&FlashProgressEvent {
+                stage: "Injection d'autounattend.xml et des patchs Debloat Windows...".to_string(),
+                percent: 94.0,
+                speed_mbps: 0.0,
+                bytes_processed: copied_bytes,
+                total_bytes: total_iso_bytes,
+                eta_seconds: Some(4),
+                log: Some(format!(
+                    "Génération de /autounattend.xml (Compte local : '{}', BypassNRO : {}) et de {} fonctions Debloat dans sources/$OEM$/$$/Setup/Scripts/noos_debloat.ps1",
+                    win_custom.local_username,
+                    win_custom.force_local_account,
+                    win_custom.enabled_features.len()
+                )),
+                completed: false,
+                error: None,
+            });
+
+            write_unattend_and_debloat_to_usb(&usb_mnt, win_custom)?;
+        }
+    }
+
+    // 8. Synchronisation finale et démontage propre
+    emit_worker_event(&FlashProgressEvent {
+        stage: "Synchronisation des caches et démontage sécurisé...".to_string(),
+        percent: 96.0,
+        speed_mbps: 0.0,
+        bytes_processed: copied_bytes,
+        total_bytes: total_iso_bytes,
+        eta_seconds: Some(3),
+        log: Some("Synchronisation des écritures sur la clé USB (sync)...".to_string()),
+        completed: false,
+        error: None,
+    });
+
+    nix::unistd::sync();
+
+    let elapsed_total = start_copy.elapsed().as_secs_f64().max(0.001);
+    let avg_speed = (copied_bytes as f64 / (1024.0 * 1024.0)) / elapsed_total;
+
+    emit_worker_event(&FlashProgressEvent {
+        stage: "Clé USB Windows UEFI créée avec succès !".to_string(),
+        percent: 100.0,
+        speed_mbps: avg_speed,
+        bytes_processed: total_iso_bytes,
+        total_bytes: total_iso_bytes,
+        eta_seconds: Some(0),
+        log: Some(format!(
+            "Clé USB Windows UEFI ({}/{}) prête à démarrer ({:.1} Mo/s).",
+            config.partition_scheme.as_str().to_uppercase(),
+            config.fs_type.as_str().to_uppercase(),
+            avg_speed
+        )),
+        completed: true,
+        error: None,
+    });
+
+    Ok(())
+}
