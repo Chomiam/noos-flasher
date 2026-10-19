@@ -1,6 +1,6 @@
 [package]
 name = "noos-win-installer"
-version = "0.1.1"
+version = "0.1.2"
 description = "Outil de création de clés USB bootables Linux (DD) et Windows UEFI avec Tauri v2"
 authors = ["Chomiam <chomiam@users.noreply.github.com>"]
 edition = "2021"

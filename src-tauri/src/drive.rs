@@ -379,6 +379,7 @@ fn to_removable_drive(dev: LsblkDevice) -> RemovableDrive {
 /// Énumère de manière sécurisée tous les périphériques blocs amovibles présents sur le système.
 pub fn list_removable_drives() -> AppResult<Vec<RemovableDrive>> {
     let output = Command::new("lsblk")
+        .env_remove("LD_LIBRARY_PATH")
         .args([
             "-J",
             "-b",

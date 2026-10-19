@@ -9,9 +9,9 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: "Version du tag de release (ex: v0.1.1)"
+        description: "Version du tag de release (ex: v0.1.2)"
         required: true
-        default: "v0.1.1"
+        default: "v0.1.2"
 
 permissions:
   contents: write
@@ -83,7 +83,7 @@ jobs:
           elif [[ "${{ github.ref }}" == refs/tags/* ]]; then
             TAG="${{ github.ref_name }}"
           else
-            TAG="v0.1.1"
+            TAG="v0.1.2"
           fi
           echo "TAG=$TAG" >> "$GITHUB_OUTPUT"
 
@@ -95,12 +95,13 @@ jobs:
           body: |
             ## ⚡ Noos Flasher ${{ steps.artifacts.outputs.TAG }} — Créateur de clés USB Bootables Linux & Windows UEFI
 
-            Outil desktop natif **Rust + Tauri v2** pour Linux (Pop!_OS, Ubuntu, Debian, Fedora, Arch) permettant de créer des clés USB bootables **Linux (Mode DD)** et **Windows 10/11 UEFI** avec studio de personnalisation et Debloat intégré.
+            Outil desktop natif **Rust + Tauri v2** pour Linux (Arch Linux, Pop!_OS, Ubuntu, Debian, Fedora) permettant de créer des clés USB bootables **Linux (Mode DD)** et **Windows 10/11 UEFI** avec studio de personnalisation et Debloat intégré.
 
             ### 🛠️ Nouveautés & Correctifs (${{ steps.artifacts.outputs.TAG }}) :
+            - 🔐 **Correction de l'élévation PolicyKit (`pkexec`) en mode `.AppImage`** : extraction et vérification automatique du worker privilégié hors du point de montage FUSE utilisateur (`/tmp/.mount_*`, inaccessible en `root` via `EACCES`), nettoyage des variables d'environnement AppImage (`LD_LIBRARY_PATH`, `GIO_MODULE_DIR`) et isolation par UID de `wimtools` (`/tmp/noos_embedded_wimtools_<uid>`).
+            - 🐧 **Support Arch Linux (AUR)** : ajout des métadonnées officielles `PKGBUILD` / `.SRCINFO` et publication sur l'Arch User Repository (`noos-win-installer`).
             - 🩹 **Correction du crash Windows 11 24H2/25H2 à 58 % (`specialize`)** : double injection XML (`<Extensions>`) + `$OEM$` garantissant l'extraction de `noos_debloat.ps1` et `noos_firstlogon.ps1` depuis `C:\Windows\Panther\unattend.xml` même avec une image découpée (`install.swm`).
             - 🔒 **Isolation stricte de `NTUSER.DAT` (`HKU\DefaultUser`)** : montage/démontage de la ruche profil par défaut dans des processus `RunSynchronousCommand` dédiés et écriture via `reg.exe add`, éliminant le verrouillage de `NTUSER.DAT` lors de la création du profil utilisateur.
-            - ⚡ **Optimisation DISM & Séparation `specialize` / `FirstLogonCommands`** : suppression groupée des paquets Appx provisionnés en une seule passe (< 10 s), déplacement de `DISM /Disable-Feature /FeatureName:Recall` et `powercfg` dans `noos_firstlogon.ps1`, et désactivation propre de OneDrive sans blocage en Session 0.
 
             ### ✨ Fonctionnalités incluses :
             - 🛡️ **Protection stricte des disques système** : exclusion automatique de `/`, `/boot`, `/home` et des disques NVMe/SATA internes.
@@ -110,6 +111,7 @@ jobs:
             - 🔐 **Élévation PolicyKit (`pkexec`)** : l'interface graphique s'exécute sans privilèges root et délègue uniquement l'écriture bloc au worker privilégié.
 
             ### 📦 Paquets disponibles :
+            - **Arch Linux (AUR)** : `yay -S noos-win-installer` / `paru -S noos-win-installer`
             - **Debian / Ubuntu / Pop!_OS / Mint** : `.deb`
             - **Fedora / RHEL / openSUSE** : `.rpm`
             - **Universel Linux Portable** : `.AppImage`

@@ -175,17 +175,30 @@ pub struct FlashProgressEvent {
     pub error: Option<String>,
 }
 
-/// Vérifie la présence d'un exécutable dans le `PATH` ou dans `/usr/sbin` / `/sbin`.
-pub fn has_command(bin: &str) -> bool {
-    if let Ok(path_var) = std::env::var("PATH") {
-        for dir in path_var.split(':').chain(["/usr/sbin", "/sbin", "/usr/bin"]) {
-            let candidate = Path::new(dir).join(bin);
-            if candidate.is_file() {
-                return true;
-            }
+/// Résout le chemin absolu d'un binaire système à travers `PATH` et les dossiers système standard (`/usr/sbin`, `/sbin`, `/usr/bin`, `/bin`).
+pub fn resolve_command_path(bin: &str) -> PathBuf {
+    let p = Path::new(bin);
+    if p.is_absolute() && p.is_file() {
+        return p.to_path_buf();
+    }
+    let path_var = std::env::var("PATH").unwrap_or_default();
+    for dir in path_var
+        .split(':')
+        .filter(|d| !d.is_empty() && !d.starts_with("/tmp/.mount_"))
+        .chain(["/usr/local/sbin", "/usr/local/bin", "/usr/sbin", "/sbin", "/usr/bin", "/bin"])
+    {
+        let candidate = Path::new(dir).join(bin);
+        if candidate.is_file() {
+            return candidate;
         }
     }
-    false
+    PathBuf::from(bin)
+}
+
+/// Vérifie la présence d'un exécutable dans le `PATH` ou dans `/usr/sbin` / `/sbin`.
+pub fn has_command(bin: &str) -> bool {
+    let resolved = resolve_command_path(bin);
+    resolved.is_absolute() && resolved.is_file()
 }
 
 /// Binaires `wimtools` (`wimlib-imagex` + `libwim.so.15` + `libntfs-3g.so.89`) embarqués directement
@@ -196,10 +209,13 @@ const EMBEDDED_LIBNTFS_SO: &[u8] = include_bytes!("../resources/wimtools/libntfs
 
 /// Extrait ou localise le binaire `wimlib-imagex` embarqué et ses bibliothèques partagées,
 /// et retourne `(chemin_wimlib_imagex, dossier_ld_library_path)`.
+/// Utilise un dossier isolé par UID (`/tmp/noos_embedded_wimtools_<uid>`) pour éviter tout conflit
+/// de permissions entre le processus graphique utilisateur et le worker privilégié `root` (`pkexec`).
 pub fn ensure_embedded_wimtools() -> AppResult<(PathBuf, PathBuf)> {
     use std::os::unix::fs::PermissionsExt;
 
-    let runtime_dir = PathBuf::from("/tmp/noos_embedded_wimtools");
+    let uid = nix::unistd::geteuid().as_raw();
+    let runtime_dir = PathBuf::from(format!("/tmp/noos_embedded_wimtools_{uid}"));
     fs::create_dir_all(&runtime_dir)?;
 
     let bin_path = runtime_dir.join("wimlib-imagex");
@@ -289,7 +305,8 @@ fn probe_iso_entries_with_7z(iso_path: &str) -> (bool, Option<u64>, bool) {
         return (false, None, false);
     }
 
-    let Ok(output) = Command::new("7z")
+    let Ok(output) = Command::new(resolve_command_path("7z"))
+        .env_remove("LD_LIBRARY_PATH")
         .args([
             "l",
             "-slt",
@@ -529,6 +546,125 @@ pub fn inspect_iso_file(iso_path: &str) -> AppResult<IsoInspection> {
     })
 }
 
+/// Garde RAII nettoyant automatiquement le binaire worker temporaire extrait hors du montage FUSE AppImage.
+struct StagedWorkerGuard {
+    path: Option<PathBuf>,
+}
+
+impl Drop for StagedWorkerGuard {
+    fn drop(&mut self) {
+        if let Some(ref p) = self.path {
+            let _ = fs::remove_file(p);
+        }
+    }
+}
+
+/// Prépare la ligne de commande du worker privilégié pour `pkexec`.
+///
+/// Lorsqu'il est exécuté depuis une `.AppImage`, `std::env::current_exe()` pointe vers
+/// `/tmp/.mount_Noos-FXXXXXX/usr/bin/noos-win-installer`, un système de fichiers FUSE monté par
+/// l'utilisateur courant auquel `root` (`pkexec`, `euid = 0`) n'a pas accès (`EACCES: Permission denied`).
+/// Cette fonction copie alors l'exécutable dans `/tmp` (ou `/var/tmp` si `/tmp` est monté en `noexec`),
+/// vérifie son exécution autonome via `--privileged-worker-check` et replie sur `--appimage-extract-and-run`
+/// si les bibliothèques système hôtes sont absentes.
+fn prepare_privileged_worker_invocation(
+    current_exe: &Path,
+    job_json: &str,
+) -> AppResult<(Vec<String>, StagedWorkerGuard)> {
+    use std::os::unix::fs::PermissionsExt;
+
+    let exe_str = current_exe.to_str().ok_or_else(|| {
+        AppError::Other(anyhow::anyhow!(
+            "Le chemin de l'exécutable contient des caractères UTF-8 invalides"
+        ))
+    })?;
+
+    let is_fuse_or_appimage = exe_str.starts_with("/tmp/.mount_")
+        || std::env::var_os("APPDIR").is_some()
+        || std::env::var_os("APPIMAGE").is_some()
+        || (!exe_str.starts_with("/usr/")
+            && !exe_str.starts_with("/opt/")
+            && !exe_str.starts_with("/bin/")
+            && !exe_str.starts_with("/sbin/"));
+
+    if !is_fuse_or_appimage {
+        return Ok((
+            vec![
+                exe_str.to_string(),
+                "--privileged-worker".to_string(),
+                "--job-json".to_string(),
+                job_json.to_string(),
+            ],
+            StagedWorkerGuard { path: None },
+        ));
+    }
+
+    let pid = std::process::id();
+    for base_dir in ["/tmp", "/var/tmp"] {
+        let staged_path = PathBuf::from(format!("{base_dir}/noos_privileged_worker_{pid}"));
+        if fs::copy(current_exe, &staged_path).is_ok() {
+            if let Ok(meta) = fs::metadata(&staged_path) {
+                let mut perms = meta.permissions();
+                perms.set_mode(0o755);
+                let _ = fs::set_permissions(&staged_path, perms);
+            }
+
+            let check_ok = Command::new(&staged_path)
+                .arg("--privileged-worker-check")
+                .current_dir("/tmp")
+                .env_remove("LD_LIBRARY_PATH")
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status()
+                .map(|s| s.success())
+                .unwrap_or(false);
+
+            if check_ok {
+                if let Some(staged_str) = staged_path.to_str() {
+                    return Ok((
+                        vec![
+                            staged_str.to_string(),
+                            "--privileged-worker".to_string(),
+                            "--job-json".to_string(),
+                            job_json.to_string(),
+                        ],
+                        StagedWorkerGuard {
+                            path: Some(staged_path),
+                        },
+                    ));
+                }
+            }
+            let _ = fs::remove_file(&staged_path);
+        }
+    }
+
+    if let Ok(appimage_path) = std::env::var("APPIMAGE") {
+        let trimmed = appimage_path.trim();
+        if !trimmed.is_empty() && Path::new(trimmed).is_file() {
+            return Ok((
+                vec![
+                    trimmed.to_string(),
+                    "--appimage-extract-and-run".to_string(),
+                    "--privileged-worker".to_string(),
+                    "--job-json".to_string(),
+                    job_json.to_string(),
+                ],
+                StagedWorkerGuard { path: None },
+            ));
+        }
+    }
+
+    Ok((
+        vec![
+            exe_str.to_string(),
+            "--privileged-worker".to_string(),
+            "--job-json".to_string(),
+            job_json.to_string(),
+        ],
+        StagedWorkerGuard { path: None },
+    ))
+}
+
 /// Lance le processus de flashage en tâche de fond via `pkexec` et relaie la progression temps réel au frontend Tauri.
 pub async fn execute_flash_with_pkexec(
     app: AppHandle,
@@ -557,11 +693,6 @@ pub async fn execute_flash_with_pkexec(
     }
 
     let current_exe = std::env::current_exe()?;
-    let exe_str = current_exe.to_str().ok_or_else(|| {
-        AppError::Other(anyhow::anyhow!(
-            "Le chemin de l'exécutable contient des caractères UTF-8 invalides"
-        ))
-    })?;
 
     let safe_label = sanitize_volume_label(&config.volume_label, "NOOS_USB");
     let normalized_job = FlashJobConfig {
@@ -574,6 +705,9 @@ pub async fn execute_flash_with_pkexec(
         windows_custom: config.windows_custom.clone(),
     };
     let job_json = serde_json::to_string(&normalized_job)?;
+
+    let (pkexec_args, _staged_worker_guard) =
+        prepare_privileged_worker_invocation(&current_exe, &job_json)?;
 
     let _ = app.emit(
         "flash-progress",
@@ -593,9 +727,22 @@ pub async fn execute_flash_with_pkexec(
         },
     );
 
-    // 2. Exécution sécurisée sans sous-shell (zéro bash -c) via pkexec vers notre propre binaire en mode worker
-    let mut child = tokio::process::Command::new("pkexec")
-        .args([exe_str, "--privileged-worker", "--job-json", &job_json])
+    // 2. Exécution sécurisée sans sous-shell (zéro bash -c) via pkexec vers notre propre binaire en mode worker.
+    // On fixe le dossier de travail sur /tmp et on purge les variables d'environnement AppImage/FUSE
+    // pour éviter tout refus d'accès root (`EACCES`) sur `/tmp/.mount_*`.
+    let pkexec_bin = resolve_command_path("pkexec");
+    let mut child = tokio::process::Command::new(pkexec_bin)
+        .current_dir("/tmp")
+        .env_remove("LD_LIBRARY_PATH")
+        .env_remove("GIO_MODULE_DIR")
+        .env_remove("GSETTINGS_SCHEMA_DIR")
+        .env_remove("GI_TYPELIB_PATH")
+        .env_remove("GTK_PATH")
+        .env_remove("GTK_EXE_PREFIX")
+        .env_remove("GTK_DATA_PREFIX")
+        .env_remove("GDK_PIXBUF_MODULE_FILE")
+        .env_remove("GTK_IM_MODULE_FILE")
+        .args(&pkexec_args)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
@@ -679,10 +826,21 @@ pub async fn execute_flash_with_pkexec(
     let status = child.wait().await?;
     if !status.success() {
         let code = status.code().unwrap_or(-1);
-        if code == 126 || code == 127 {
+        if code == 126 {
             return Err(AppError::PrivilegeElevationDenied(
                 "Authentification PolicyKit annulée ou refusée.".to_string(),
             ));
+        }
+        if code == 127 {
+            let detail = if last_error_msg.is_empty()
+                || last_error_msg.contains("Request dismissed")
+                || last_error_msg.contains("Not authorized")
+            {
+                "Authentification PolicyKit annulée ou refusée.".to_string()
+            } else {
+                format!("Authentification PolicyKit impossible ({last_error_msg}).")
+            };
+            return Err(AppError::PrivilegeElevationDenied(detail));
         }
         let reason = if last_error_msg.is_empty() {
             format!("Le worker privilégié s'est terminé avec le code {code}")
@@ -845,15 +1003,25 @@ fn unmount_all_device_partitions(
         error: None,
     });
 
+    let umount_bin = resolve_command_path("umount");
     for part in partitions {
         if part.mountpoint.is_some() {
-            let _ = Command::new("umount").arg(&part.path).status();
-            let _ = Command::new("umount").args(["-l", &part.path]).status();
+            let _ = Command::new(&umount_bin)
+                .env_remove("LD_LIBRARY_PATH")
+                .arg(&part.path)
+                .status();
+            let _ = Command::new(&umount_bin)
+                .env_remove("LD_LIBRARY_PATH")
+                .args(["-l", &part.path])
+                .status();
         }
     }
 
     // Démontage éventuel du périphérique bloc racine s'il était monté en direct (ex: iso9660)
-    let _ = Command::new("umount").arg(device_path).status();
+    let _ = Command::new(&umount_bin)
+        .env_remove("LD_LIBRARY_PATH")
+        .arg(device_path)
+        .status();
     Ok(())
 }
 
@@ -962,8 +1130,14 @@ fn run_linux_dd_flash(
     drop(dst_device);
     nix::unistd::sync();
 
-    let _ = Command::new("partprobe").arg(&config.device_path).status();
-    let _ = Command::new("udevadm").arg("settle").status();
+    let _ = Command::new(resolve_command_path("partprobe"))
+        .env_remove("LD_LIBRARY_PATH")
+        .arg(&config.device_path)
+        .status();
+    let _ = Command::new(resolve_command_path("udevadm"))
+        .env_remove("LD_LIBRARY_PATH")
+        .arg("settle")
+        .status();
 
     let total_elapsed = start_time.elapsed().as_secs_f64().max(0.001);
     let avg_speed = (bytes_written as f64 / (1024.0 * 1024.0)) / total_elapsed;
@@ -995,10 +1169,23 @@ struct MountCleanupGuard {
 
 impl Drop for MountCleanupGuard {
     fn drop(&mut self) {
-        let _ = Command::new("umount").arg(&self.usb_mnt).status();
-        let _ = Command::new("umount").args(["-l", &self.usb_mnt.to_string_lossy()]).status();
-        let _ = Command::new("umount").arg(&self.iso_mnt).status();
-        let _ = Command::new("umount").args(["-l", &self.iso_mnt.to_string_lossy()]).status();
+        let umount_bin = resolve_command_path("umount");
+        let _ = Command::new(&umount_bin)
+            .env_remove("LD_LIBRARY_PATH")
+            .arg(&self.usb_mnt)
+            .status();
+        let _ = Command::new(&umount_bin)
+            .env_remove("LD_LIBRARY_PATH")
+            .args(["-l", &self.usb_mnt.to_string_lossy()])
+            .status();
+        let _ = Command::new(&umount_bin)
+            .env_remove("LD_LIBRARY_PATH")
+            .arg(&self.iso_mnt)
+            .status();
+        let _ = Command::new(&umount_bin)
+            .env_remove("LD_LIBRARY_PATH")
+            .args(["-l", &self.iso_mnt.to_string_lossy()])
+            .status();
         let _ = fs::remove_dir(&self.usb_mnt);
         let _ = fs::remove_dir(&self.iso_mnt);
     }
@@ -1006,7 +1193,10 @@ impl Drop for MountCleanupGuard {
 
 /// Exécute une commande système avec arguments vectorisés et retourne une erreur typée en cas d'échec.
 fn run_checked_command(bin: &str, args: &[&str]) -> AppResult<()> {
-    let output = Command::new(bin).args(args).output()?;
+    let output = Command::new(resolve_command_path(bin))
+        .env_remove("LD_LIBRARY_PATH")
+        .args(args)
+        .output()?;
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
         let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
@@ -1123,8 +1313,14 @@ fn run_windows_uefi_flash(
         }
     }
 
-    let _ = Command::new("partprobe").arg(&config.device_path).status();
-    let _ = Command::new("udevadm").arg("settle").status();
+    let _ = Command::new(resolve_command_path("partprobe"))
+        .env_remove("LD_LIBRARY_PATH")
+        .arg(&config.device_path)
+        .status();
+    let _ = Command::new(resolve_command_path("udevadm"))
+        .env_remove("LD_LIBRARY_PATH")
+        .arg("settle")
+        .status();
 
     let part_path = partition_path_for_disk(&config.device_path, 1);
     for _ in 0..25 {
@@ -1448,11 +1644,24 @@ fn run_windows_uefi_flash(
     });
 
     nix::unistd::sync();
-    let _ = Command::new("umount").arg(&usb_mnt).status();
-    let _ = Command::new("umount").arg(&iso_mnt).status();
+    let umount_bin = resolve_command_path("umount");
+    let _ = Command::new(&umount_bin)
+        .env_remove("LD_LIBRARY_PATH")
+        .arg(&usb_mnt)
+        .status();
+    let _ = Command::new(&umount_bin)
+        .env_remove("LD_LIBRARY_PATH")
+        .arg(&iso_mnt)
+        .status();
     nix::unistd::sync();
-    let _ = Command::new("partprobe").arg(&config.device_path).status();
-    let _ = Command::new("udevadm").arg("settle").status();
+    let _ = Command::new(resolve_command_path("partprobe"))
+        .env_remove("LD_LIBRARY_PATH")
+        .arg(&config.device_path)
+        .status();
+    let _ = Command::new(resolve_command_path("udevadm"))
+        .env_remove("LD_LIBRARY_PATH")
+        .arg("settle")
+        .status();
 
     let elapsed_total = start_copy.elapsed().as_secs_f64().max(0.001);
     let avg_speed = (copied_bytes as f64 / (1024.0 * 1024.0)) / elapsed_total;
@@ -1476,3 +1685,56 @@ fn run_windows_uefi_flash(
 
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::os::unix::fs::PermissionsExt;
+
+    #[test]
+    fn test_resolve_command_path_finds_system_binaries() {
+        let lsblk = resolve_command_path("lsblk");
+        assert!(lsblk.is_absolute());
+        assert!(lsblk.is_file());
+    }
+
+    #[test]
+    fn test_ensure_embedded_wimtools_per_uid() {
+        let (bin_path, lib_dir) = ensure_embedded_wimtools().expect("wimtools extraction");
+        assert!(bin_path.is_file());
+        assert!(lib_dir.is_dir());
+        let uid = nix::unistd::geteuid().as_raw();
+        assert!(lib_dir
+            .to_string_lossy()
+            .ends_with(&format!("noos_embedded_wimtools_{uid}")));
+    }
+
+    #[test]
+    fn test_prepare_privileged_worker_stages_outside_fuse_and_cleans_up() {
+        let fake_fuse_dir = PathBuf::from(format!("/tmp/noos_test_fuse_{}", std::process::id()));
+        fs::create_dir_all(&fake_fuse_dir).unwrap();
+        let fake_exe = fake_fuse_dir.join("fake-worker.sh");
+        fs::write(&fake_exe, "#!/bin/sh\nexit 0\n").unwrap();
+        let mut perms = fs::metadata(&fake_exe).unwrap().permissions();
+        perms.set_mode(0o755);
+        fs::set_permissions(&fake_exe, perms).unwrap();
+
+        let (args, guard) =
+            prepare_privileged_worker_invocation(&fake_exe, r#"{"test":true}"#).unwrap();
+        assert_eq!(args.len(), 4);
+        assert_eq!(args[1], "--privileged-worker");
+        assert_eq!(args[2], "--job-json");
+        assert_eq!(args[3], r#"{"test":true}"#);
+
+        let staged_path = PathBuf::from(&args[0]);
+        assert!(staged_path
+            .to_string_lossy()
+            .starts_with("/tmp/noos_privileged_worker_"));
+        assert!(staged_path.is_file());
+
+        drop(guard);
+        assert!(!staged_path.exists());
+        let _ = fs::remove_dir_all(&fake_fuse_dir);
+    }
+}
+

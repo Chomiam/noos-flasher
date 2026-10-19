@@ -11,6 +11,9 @@ use commands::AppState;
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     let args: Vec<String> = std::env::args().collect();
+    if args.iter().any(|arg| arg == "--privileged-worker-check") {
+        std::process::exit(0);
+    }
     if args.iter().any(|arg| arg == "--privileged-worker") {
         let exit_code = writer::run_privileged_worker_from_args(&args);
         std::process::exit(exit_code);
