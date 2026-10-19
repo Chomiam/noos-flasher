@@ -35,7 +35,7 @@ optdepends=(
 )
 options=('!lto')
 source=("${pkgname}-${pkgver}.tar.gz::https://github.com/Chomiam/noos_win_installer/archive/refs/tags/v${pkgver}.tar.gz")
-sha256sums=('SKIP')
+sha256sums=('db6ce34b1240442178aef768afe85b4e198a02cb9eb8bd87e3675bada244cbb4')
 
 prepare() {
   cd "${srcdir}/noos_win_installer-${pkgver}/src-tauri"
