@@ -1,6 +1,6 @@
 {
   "name": "noos-win-installer",
-  "version": "0.1.2",
+  "version": "0.1.3",
   "private": true,
   "description": "Outil desktop moderne de création de clés USB bootables Linux (DD) & Windows UEFI (Tauri v2)",
   "scripts": {

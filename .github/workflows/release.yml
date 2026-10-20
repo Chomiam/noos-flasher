@@ -9,9 +9,9 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: "Version du tag de release (ex: v0.1.2)"
+        description: "Version du tag de release (ex: v0.1.3)"
         required: true
-        default: "v0.1.2"
+        default: "v0.1.3"
 
 permissions:
   contents: write
@@ -83,7 +83,7 @@ jobs:
           elif [[ "${{ github.ref }}" == refs/tags/* ]]; then
             TAG="${{ github.ref_name }}"
           else
-            TAG="v0.1.2"
+            TAG="v0.1.3"
           fi
           echo "TAG=$TAG" >> "$GITHUB_OUTPUT"
 
@@ -98,10 +98,10 @@ jobs:
             Outil desktop natif **Rust + Tauri v2** pour Linux (Arch Linux, Pop!_OS, Ubuntu, Debian, Fedora) permettant de créer des clés USB bootables **Linux (Mode DD)** et **Windows 10/11 UEFI** avec studio de personnalisation et Debloat intégré.
 
             ### 🛠️ Nouveautés & Correctifs (${{ steps.artifacts.outputs.TAG }}) :
+            - 📦 **Inclusion de `libfuse3.so.3` dans `wimtools` embarqué** : correction de l'erreur `libfuse3.so.3: cannot open shared object file` lors du découpage `wimlib-imagex split` de `install.wim` (> 4 Gio en FAT32) sur les distributions récentes (Arch Linux avec `libfuse3.so.4`). Les outils `wimtools` embarqués (`wimlib-imagex`, `libwim.so.15`, `libntfs-3g.so.89`, `libfuse3.so.3`) ne dépendent désormais plus que de `libc.so.6`.
             - 🔐 **Correction de l'élévation PolicyKit (`pkexec`) en mode `.AppImage`** : extraction et vérification automatique du worker privilégié hors du point de montage FUSE utilisateur (`/tmp/.mount_*`, inaccessible en `root` via `EACCES`), nettoyage des variables d'environnement AppImage (`LD_LIBRARY_PATH`, `GIO_MODULE_DIR`) et isolation par UID de `wimtools` (`/tmp/noos_embedded_wimtools_<uid>`).
             - 🐧 **Support Arch Linux (AUR)** : ajout des métadonnées officielles `PKGBUILD` / `.SRCINFO` et publication sur l'Arch User Repository (`noos-win-installer`).
             - 🩹 **Correction du crash Windows 11 24H2/25H2 à 58 % (`specialize`)** : double injection XML (`<Extensions>`) + `$OEM$` garantissant l'extraction de `noos_debloat.ps1` et `noos_firstlogon.ps1` depuis `C:\Windows\Panther\unattend.xml` même avec une image découpée (`install.swm`).
-            - 🔒 **Isolation stricte de `NTUSER.DAT` (`HKU\DefaultUser`)** : montage/démontage de la ruche profil par défaut dans des processus `RunSynchronousCommand` dédiés et écriture via `reg.exe add`, éliminant le verrouillage de `NTUSER.DAT` lors de la création du profil utilisateur.
 
             ### ✨ Fonctionnalités incluses :
             - 🛡️ **Protection stricte des disques système** : exclusion automatique de `/`, `/boot`, `/home` et des disques NVMe/SATA internes.

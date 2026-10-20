@@ -201,11 +201,12 @@ pub fn has_command(bin: &str) -> bool {
     resolved.is_absolute() && resolved.is_file()
 }
 
-/// Binaires `wimtools` (`wimlib-imagex` + `libwim.so.15` + `libntfs-3g.so.89`) embarqués directement
-/// dans l'exécutable Rust afin qu'aucun utilisateur Linux n'ait besoin d'installer `wimtools` manuellement.
+/// Binaires `wimtools` (`wimlib-imagex` + `libwim.so.15` + `libntfs-3g.so.89` + `libfuse3.so.3`) embarqués directement
+/// dans l'exécutable Rust afin qu'aucun utilisateur Linux n'ait besoin d'installer `wimtools` ou `libfuse3.so.3` manuellement.
 const EMBEDDED_WIMLIB_BIN: &[u8] = include_bytes!("../resources/wimtools/wimlib-imagex");
 const EMBEDDED_LIBWIM_SO: &[u8] = include_bytes!("../resources/wimtools/libwim.so.15");
 const EMBEDDED_LIBNTFS_SO: &[u8] = include_bytes!("../resources/wimtools/libntfs-3g.so.89");
+const EMBEDDED_LIBFUSE3_SO: &[u8] = include_bytes!("../resources/wimtools/libfuse3.so.3");
 
 /// Extrait ou localise le binaire `wimlib-imagex` embarqué et ses bibliothèques partagées,
 /// et retourne `(chemin_wimlib_imagex, dossier_ld_library_path)`.
@@ -221,6 +222,7 @@ pub fn ensure_embedded_wimtools() -> AppResult<(PathBuf, PathBuf)> {
     let bin_path = runtime_dir.join("wimlib-imagex");
     let libwim_path = runtime_dir.join("libwim.so.15");
     let libntfs_path = runtime_dir.join("libntfs-3g.so.89");
+    let libfuse3_path = runtime_dir.join("libfuse3.so.3");
 
     let needs_extract = !bin_path.exists()
         || fs::metadata(&bin_path)
@@ -234,17 +236,25 @@ pub fn ensure_embedded_wimtools() -> AppResult<(PathBuf, PathBuf)> {
         fs::set_permissions(&bin_path, perms)?;
     }
 
-    if !libwim_path.exists() {
-        fs::write(&libwim_path, EMBEDDED_LIBWIM_SO)?;
-    }
-    if !libntfs_path.exists() {
-        fs::write(&libntfs_path, EMBEDDED_LIBNTFS_SO)?;
+    for (path, bytes) in [
+        (&libwim_path, EMBEDDED_LIBWIM_SO),
+        (&libntfs_path, EMBEDDED_LIBNTFS_SO),
+        (&libfuse3_path, EMBEDDED_LIBFUSE3_SO),
+    ] {
+        let needs_lib = !path.exists()
+            || fs::metadata(path)
+                .map(|m| m.len() != bytes.len() as u64)
+                .unwrap_or(true);
+        if needs_lib {
+            fs::write(path, bytes)?;
+        }
     }
 
     Ok((bin_path, runtime_dir))
 }
 
-/// Exécute `wimlib-imagex split` en utilisant prioritairement la version embarquée autonome.
+/// Exécute `wimlib-imagex split` en utilisant prioritairement la version embarquée autonome,
+/// avec repli automatique sur `wimlib-imagex` système s'il est installé.
 fn run_embedded_wimsplit(wim_src_str: &str, swm_dst_str: &str) -> AppResult<()> {
     let (bin_path, lib_dir) = ensure_embedded_wimtools()?;
     let output = Command::new(&bin_path)
@@ -252,16 +262,30 @@ fn run_embedded_wimsplit(wim_src_str: &str, swm_dst_str: &str) -> AppResult<()> 
         .args(["split", wim_src_str, swm_dst_str, "3800"])
         .output()?;
 
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
-        let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
-        let details = if !stderr.is_empty() { stderr } else { stdout };
-        return Err(AppError::CommandFailed {
-            cmd: "wimlib-imagex split (embedded)".to_string(),
-            details,
-        });
+    if output.status.success() {
+        return Ok(());
     }
-    Ok(())
+
+    if has_command("wimlib-imagex") {
+        let sys_bin = resolve_command_path("wimlib-imagex");
+        if let Ok(sys_out) = Command::new(sys_bin)
+            .env_remove("LD_LIBRARY_PATH")
+            .args(["split", wim_src_str, swm_dst_str, "3800"])
+            .output()
+        {
+            if sys_out.status.success() {
+                return Ok(());
+            }
+        }
+    }
+
+    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+    let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    let details = if !stderr.is_empty() { stderr } else { stdout };
+    Err(AppError::CommandFailed {
+        cmd: "wimlib-imagex split (embedded)".to_string(),
+        details,
+    })
 }
 
 /// Retourne toujours un binaire de découpage WIM valide (embarqué dans l'application ou système).
@@ -1703,10 +1727,24 @@ mod tests {
         let (bin_path, lib_dir) = ensure_embedded_wimtools().expect("wimtools extraction");
         assert!(bin_path.is_file());
         assert!(lib_dir.is_dir());
+        assert!(lib_dir.join("libwim.so.15").is_file());
+        assert!(lib_dir.join("libntfs-3g.so.89").is_file());
+        assert!(lib_dir.join("libfuse3.so.3").is_file());
         let uid = nix::unistd::geteuid().as_raw();
         assert!(lib_dir
             .to_string_lossy()
             .ends_with(&format!("noos_embedded_wimtools_{uid}")));
+
+        let output = Command::new(&bin_path)
+            .env("LD_LIBRARY_PATH", &lib_dir)
+            .arg("--version")
+            .output()
+            .expect("execution wimlib-imagex --version");
+        assert!(
+            output.status.success(),
+            "wimlib-imagex --version failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
     }
 
     #[test]
