@@ -294,10 +294,7 @@ fn is_safe_removable_disk(dev: &LsblkDevice) -> bool {
 /// Convertit un `LsblkDevice` validé en `RemovableDrive`.
 fn to_removable_drive(dev: LsblkDevice) -> RemovableDrive {
     let kname = dev.kname.clone().unwrap_or_else(|| dev.name.clone());
-    let path = dev
-        .path
-        .clone()
-        .unwrap_or_else(|| format!("/dev/{kname}"));
+    let path = dev.path.clone().unwrap_or_else(|| format!("/dev/{kname}"));
 
     let vendor = dev
         .vendor

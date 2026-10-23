@@ -1,77 +1,167 @@
-# Noos Flasher (`noos_win_installer`)
+# Noos Flasher
 
-Outil desktop moderne, rapide et sécurisé de création de clés USB bootables **Linux (ISO Hybride / DD)** et **Windows 10/11 UEFI**, développé en **Rust + Tauri v2** pour Pop!_OS / Linux.
+**Noos Flasher** est un créateur de clés USB bootables **Linux (ISO hybride / DD)** et **Windows 10/11 UEFI**, développé en **Rust** avec une interface native **GTK4 / Libadwaita**.
 
-## Architecture du Projet
+Il remplace le frontend Tauri v2 d'origine : le backend d'écriture, d'inspection ISO, de partitionnement et de debloat Windows est conservé, tandis que l'interface est désormais une application GNOME native, sans WebView, sans Node.js et sans IPC JavaScript.
+
+---
+
+## Fonctionnalités
+
+### Périphériques et sécurité
+- Détection des clés USB via `lsblk`, `/sys/block` et `/proc/mounts`.
+- Exclusion automatique de `/`, `/boot`, `/boot/efi`, `/home`, `/nix`, des disques NVMe/SATA/PCIe internes et des périphériques virtuels.
+- Double validation du périphérique cible côté utilisateur **et** dans le worker root lancé par `pkexec`.
+
+### Images disque
+- Inspection binaire des signatures **MBR** (`0x55AA`), **GPT** (`EFI PART`), **ISO 9660** (`CD001`), **El Torito** et **UDF** (`NSR02`/`NSR03`).
+- Détection des installateurs Windows UEFI (`sources/install.wim`, `sources/boot.wim`, `bootmgr.efi`) et de la limite FAT32 de 4 Gio.
+- Mode **DD** pour les ISO Linux hybrides et les images `.img`, avec streaming par blocs de 4 Mio, mesure de vitesse et `sync` matériel.
+
+### Windows 10/11 UEFI
+- Partitionnement **GPT** ou **MBR**, formatage **FAT32** ou **NTFS**.
+- Découpage automatique de `install.wim` en `.swm` (3800 Mio max) via `wimlib-imagex` **embarqué** dans le binaire, avec ses bibliothèques `libwim`, `libntfs-3g` et `libfuse3`.
+- Génération de `/autounattend.xml`, `noos_debloat.ps1` et `noos_firstlogon.ps1`.
+- **Debloat Studio** : 22 patchs configurables (Copilot, Recall, Bing, Cortana, Widgets, OneDrive, télémétrie, bloatwares UWP, menu contextuel classique, etc.).
+- Compte local administrateur pré-configuré, `BypassNRO`, bypass TPM/Secure Boot/RAM, langue française.
+
+### Interface GTK4 / Libadwaita
+- Fenêtre native GNOME avec `AdwHeaderBar`, `AdwPreferencesGroup`, `AdwSwitchRow`, `AdwComboRow`, `AdwBanner`, `AdwToastOverlay` et `AdwMessageDialog`.
+- Sélection de l'ISO via `GtkFileDialog`, confirmation destructive native et aperçu des scripts dans un `AdwDialog`.
+- Le volet **Personnalisation Windows / Debloat** n'apparaît que lorsqu'une ISO réellement détectée comme installateur Windows est sélectionnée.
+- Progression temps réel, vitesse, ETA, journal copiable et annulation.
+- Aucune dépendance à WebKitGTK, Node.js, npm ou Tauri.
+
+### Dépendances système
+Noos Flasher s'appuie sur les outils système suivants, **livrés comme dépendances dans chaque paquet** :
+
+- **`ntfs-3g`** : support NTFS et `mount.ntfs-3g` ;
+- **`ntfsprogs`** : `mkfs.ntfs` / `mkntfs`, `ntfsfix` et utilitaires NTFS ;
+- `parted`, `dosfstools`, `polkit` (`pkexec`), `util-linux` ;
+- `7z` est optionnel (sonde rapide des métadonnées ISO) ;
+- `wimtools` n'est pas requis : `wimlib-imagex` est embarqué.
+
+> Sur Debian/Ubuntu, l'ancien paquet `ntfsprogs` a été fusionné dans `ntfs-3g` : ce dernier fournit bien `mkntfs` et `ntfsfix`. Sur Arch Linux et Fedora, `ntfs-3g` et `ntfsprogs` sont deux paquets distincts et sont déclarés séparément.
+
+---
+
+## Installation
+
+### Arch Linux (AUR)
+
+```bash
+yay -S noos-flasher
+# ou
+paru -S noos-flasher
+```
+
+Le paquet fournit `/usr/bin/noos-flasher`, le fichier `.desktop` et les icônes hicolor. Il remplace `noos-win-installer`.
+
+### Debian / Ubuntu / Pop!_OS
+
+```bash
+sudo apt install parted dosfstools ntfs-3g polkit-1 7zip
+# puis installer le .deb fourni dans la release
+sudo apt install ./noos-flasher_*.deb
+```
+
+### Fedora / openSUSE
+
+```bash
+sudo dnf install parted dosfstools ntfs-3g ntfsprogs polkit
+sudo dnf install ./noos-flasher-*.rpm
+```
+
+### AppImage
+
+L'AppImage est portable mais utilise les outils système de l'hôte (`pkexec`, `parted`, `mkfs.vfat`, `mkfs.ntfs`, `ntfs-3g`). Installez au minimum :
+
+```bash
+sudo apt install parted dosfstools ntfs-3g polkit-1
+```
+
+---
+
+## Compilation depuis les sources
+
+### Prérequis (Arch Linux)
+
+```bash
+sudo pacman -S --needed rust cargo gtk4 libadwaita \
+  parted dosfstools ntfs-3g ntfsprogs polkit util-linux 7zip
+```
+
+### Prérequis (Debian / Ubuntu)
+
+```bash
+sudo apt install build-essential pkg-config libgtk-4-dev libadwaita-1-dev \
+  parted dosfstools ntfs-3g polkit-1 7zip
+```
+
+### Compilation
+
+```bash
+git clone https://github.com/Chomiam/noos-flasher.git
+cd noos-flasher
+cargo build --release
+
+# Lancer l'interface
+./target/release/noos-flasher
+
+# Ouvrir directement une image (le volet Windows apparaît si l'ISO est un
+# installateur Windows 10/11)
+./target/release/noos-flasher ~/Téléchargements/Win11_24H2.iso
+```
+
+### Tests et qualité
+
+```bash
+cargo test
+cargo clippy --all-targets -- -D warnings
+cargo fmt --check
+```
+
+### Worker privilégié
+
+L'application graphique ne tourne jamais en root. Au démarrage du flashage, elle appelle :
+
+```bash
+pkexec /usr/bin/noos-flasher --privileged-worker --job-json '<json>'
+```
+
+Le worker est le même binaire, sans initialisation GTK. En mode AppImage, il est copié hors du montage FUSE utilisateur (`/tmp/.mount_*`) pour que `pkexec` puisse l'exécuter.
+
+---
+
+## Structure du projet
 
 ```text
-noos_win_installer/
-├── package.json
-├── ui/                          # Frontend Vanilla ES6+ (Catppuccin Mocha)
-│   ├── index.html               # Interface 2 colonnes + modale de confirmation
-│   ├── styles.css               # Design système sombre réactif
-│   └── app.js                   # Client IPC Tauri v2 & suivi temps réel
-└── src-tauri/                   # Backend natif Rust (Tauri v2)
-    ├── Cargo.toml
-    ├── tauri.conf.json
-    ├── capabilities/
-    │   └── default.json         # Permissions Tauri v2 (core, event, dialog)
-    └── src/
-        ├── main.rs              # Point d'entrée binaire
-        ├── lib.rs               # Initialisation Tauri & interception --privileged-worker
-        ├── error.rs             # Gestion d'erreurs typée (thiserror + anyhow)
-        ├── drive.rs             # Détection USB (lsblk + sysfs + /proc/mounts) & exclusion /
-        ├── writer.rs            # Inspection ISO, flash DD, Windows UEFI, wimlib & pkexec
-        └── commands.rs          # Commandes Tauri asynchrones (spawn_blocking)
+noos-flasher/
+├── Cargo.toml                  # Crate Rust, métadonnées .deb et .rpm
+├── assets/
+│   └── icons/                  # Icônes hicolor (32 → 512 px)
+├── packaging/
+│   ├── PKGBUILD                # Paquet Arch Linux / AUR
+│   ├── .SRCINFO
+│   └── io.github.chomiam.NoosFlasher.desktop
+├── resources/
+│   └── wimtools/               # wimlib-imagex + bibliothèques embarquées
+└── src/
+    ├── main.rs                 # Entrée GTK4 + mode --privileged-worker
+    ├── backend/
+    │   ├── mod.rs
+    │   ├── error.rs            # Erreurs typées (thiserror)
+    │   ├── drive.rs            # Détection et validation des disques USB
+    │   ├── writer.rs           # Inspection ISO, DD, Windows UEFI, pkexec
+    │   └── debloat.rs          # autounattend.xml + scripts PowerShell
+    └── ui/
+        ├── mod.rs              # Application GTK4 / Libadwaita
+        ├── window.rs           # Fenêtre, formulaires, progression, dialogues
+        └── style.css           # Styles complémentaires
 ```
 
-## Fonctionnalités Clés
+---
 
-1. **Isolation stricte des disques système (`drive.rs`)** :
-   - Double vérification via `lsblk --json`, `/sys/block/<dev>/removable` et `/proc/mounts`.
-   - Exclusion inconditionnelle de `/`, `/boot`, `/boot/efi`, `/recovery`, `/home`, `/nix`, `[SWAP]` et des bus internes (`nvme`, `sata`, `pcie`).
-2. **Inspection intelligente des images `.iso` / `.img` (`writer.rs`)** :
-   - Analyse binaire des en-têtes MBR (`0x55AA`), GPT (`EFI PART`), ISO 9660 (`CD001`), El Torito et UDF (`NSR02`/`NSR03`).
-   - Détection des installateurs Windows UEFI (`sources/install.wim`, `sources/boot.wim`, `bootmgr.efi`) et vérification de la taille de `install.wim` vis-à-vis de la limite FAT32 (`4 Gio - 1 octet`).
-3. **Deux moteurs d'écriture avec progression temps réel (`tauri::Emitter`)** :
-   - **Mode DD (Linux Hybride / `.img`)** : Streaming direct par blocs de 4 Mio avec `sync_data()` périodique (mesure réelle de la vitesse en Mo/s) et `sync_all()` + `sync` final.
-   - **Mode Windows UEFI** : Nettoyage `wipefs`, partitionnement `GPT` ou `MBR` (`parted`), formatage `FAT32` (`mkfs.vfat`) ou `NTFS` (`mkfs.ntfs`), extraction streamée des fichiers et découpage automatique de `sources/install.wim` en fichiers `.swm` (3800 Mio max) via `wimlib-imagex split` lorsque FAT32 est sélectionné et que `install.wim > 4 Gio`.
-4. **Élévation de privilèges PolicyKit (`pkexec`) sans lancer l'UI en root (compatible `.deb`, `.rpm`, `.AppImage` et `AUR`)** :
-   - L'interface graphique Tauri s'exécute avec les droits utilisateur standard.
-   - Au démarrage du flash, le backend invoque `pkexec <binaire> --privileged-worker ...` avec des arguments vectorisés (aucun appel `bash -c` ou `sh -c`) et récupère les événements JSON en temps réel sur `stdout`.
-   - En mode **`.AppImage`**, le binaire worker est automatiquement extrait et vérifié hors du point de montage FUSE utilisateur (`/tmp/.mount_*`) afin de permettre son exécution par `root` (`pkexec`) sans erreur `EACCES`.
+## Licence
 
-## Installation sur Arch Linux (AUR)
-
-Le paquet officiel **[`noos-win-installer`](https://aur.archlinux.org/packages/noos-win-installer)** (alias `noos-flasher`) est disponible sur l'**Arch User Repository (AUR)** :
-
-```bash
-# Avec yay
-yay -S noos-win-installer
-
-# Ou avec paru
-paru -S noos-win-installer
-
-# Ou manuellement via makepkg
-git clone https://aur.archlinux.org/noos-win-installer.git
-cd noos-win-installer
-makepkg -si
-```
-
-## Prérequis Système (Pop!_OS / Ubuntu / Debian)
-
-```bash
-sudo apt install parted dosfstools ntfs-3g p7zip-full wimtools policykit-1
-```
-
-## Développement & Exécution
-
-```bash
-# Vérification syntaxique et tests unitaires
-cargo check --manifest-path src-tauri/Cargo.toml
-cargo test --manifest-path src-tauri/Cargo.toml --lib
-node -c ui/app.js
-
-# Lancement en mode développement Tauri v2
-cargo tauri dev
-```
+Distribué sous licence **MIT**. Voir [LICENSE](LICENSE).

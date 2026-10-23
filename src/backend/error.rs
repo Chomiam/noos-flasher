@@ -1,8 +1,7 @@
 use serde::Serialize;
 use thiserror::Error;
 
-/// Erreurs typées du backend Noos USB & Windows Installer.
-/// Implémente `Serialize` pour être retourné directement par les commandes Tauri v2.
+/// Erreurs typées du backend Noos Flasher.
 #[derive(Debug, Error)]
 pub enum AppError {
     #[error("Erreur d'entrée/sortie : {0}")]
@@ -10,9 +9,6 @@ pub enum AppError {
 
     #[error("Erreur de sérialisation JSON : {0}")]
     Json(#[from] serde_json::Error),
-
-    #[error("Erreur interne Tauri : {0}")]
-    Tauri(#[from] tauri::Error),
 
     #[error("Sécurité disque : {0}")]
     UnsafeDevice(String),

@@ -268,7 +268,9 @@ fn escape_xml(input: &str) -> String {
 
 /// Nettoie le nom d'utilisateur local Windows (caractères interdits par NetBIOS/SAM éliminés, max 20 chars).
 pub fn sanitize_windows_username(raw: &str) -> String {
-    let forbidden = ['"', '/', '\\', '[', ']', ':', ';', '|', '=', ',', '+', '*', '?', '<', '>'];
+    let forbidden = [
+        '"', '/', '\\', '[', ']', ':', ';', '|', '=', ',', '+', '*', '?', '<', '>',
+    ];
     let cleaned: String = raw
         .trim()
         .chars()
@@ -1066,7 +1068,10 @@ fn resolve_sources_dir(usb_mount_dir: &Path) -> std::path::PathBuf {
     if let Ok(entries) = fs::read_dir(usb_mount_dir) {
         for entry in entries.flatten() {
             if entry.file_type().map(|t| t.is_dir()).unwrap_or(false)
-                && entry.file_name().to_string_lossy().eq_ignore_ascii_case("sources")
+                && entry
+                    .file_name()
+                    .to_string_lossy()
+                    .eq_ignore_ascii_case("sources")
             {
                 return entry.path();
             }
@@ -1149,4 +1154,3 @@ mod tests {
         assert!(fl.contains("exit 0"));
     }
 }
-

@@ -10,9 +10,12 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
-use tauri::{AppHandle, Emitter};
 use tokio::io::{AsyncBufReadExt, BufReader};
 use walkdir::WalkDir;
+
+/// Callback appelé à chaque étape du flashage. Il est exécuté depuis le thread
+/// de travail : l'interface graphique relaie les événements vers sa boucle GTK.
+pub type ProgressCallback = Arc<dyn Fn(FlashProgressEvent) + Send + Sync>;
 
 /// Taille maximale d'un fichier sur un système de fichiers FAT32 (4 Gio - 1 octet).
 pub const FAT32_MAX_FILE_SIZE: u64 = 4_294_967_295;
@@ -136,18 +139,6 @@ pub struct IsoInspection {
     pub details: String,
 }
 
-/// État des outils système installés sur l'hôte Linux.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct SystemCapabilities {
-    pub pkexec: bool,
-    pub lsblk: bool,
-    pub parted: bool,
-    pub mkfs_vfat: bool,
-    pub mkfs_ntfs: bool,
-    pub seven_zip: bool,
-    pub wimlib_imagex: bool,
-}
-
 /// Paramètres d'une tâche d'écriture USB.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FlashJobConfig {
@@ -161,7 +152,7 @@ pub struct FlashJobConfig {
     pub windows_custom: Option<WindowsCustomConfig>,
 }
 
-/// Événement de progression temps réel émis vers le frontend via `tauri::Emitter`.
+/// Événement de progression temps réel relayé à l'interface graphique.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FlashProgressEvent {
     pub stage: String,
@@ -185,7 +176,14 @@ pub fn resolve_command_path(bin: &str) -> PathBuf {
     for dir in path_var
         .split(':')
         .filter(|d| !d.is_empty() && !d.starts_with("/tmp/.mount_"))
-        .chain(["/usr/local/sbin", "/usr/local/bin", "/usr/sbin", "/sbin", "/usr/bin", "/bin"])
+        .chain([
+            "/usr/local/sbin",
+            "/usr/local/bin",
+            "/usr/sbin",
+            "/sbin",
+            "/usr/bin",
+            "/bin",
+        ])
     {
         let candidate = Path::new(dir).join(bin);
         if candidate.is_file() {
@@ -203,10 +201,10 @@ pub fn has_command(bin: &str) -> bool {
 
 /// Binaires `wimtools` (`wimlib-imagex` + `libwim.so.15` + `libntfs-3g.so.89` + `libfuse3.so.3`) embarqués directement
 /// dans l'exécutable Rust afin qu'aucun utilisateur Linux n'ait besoin d'installer `wimtools` ou `libfuse3.so.3` manuellement.
-const EMBEDDED_WIMLIB_BIN: &[u8] = include_bytes!("../resources/wimtools/wimlib-imagex");
-const EMBEDDED_LIBWIM_SO: &[u8] = include_bytes!("../resources/wimtools/libwim.so.15");
-const EMBEDDED_LIBNTFS_SO: &[u8] = include_bytes!("../resources/wimtools/libntfs-3g.so.89");
-const EMBEDDED_LIBFUSE3_SO: &[u8] = include_bytes!("../resources/wimtools/libfuse3.so.3");
+const EMBEDDED_WIMLIB_BIN: &[u8] = include_bytes!("../../resources/wimtools/wimlib-imagex");
+const EMBEDDED_LIBWIM_SO: &[u8] = include_bytes!("../../resources/wimtools/libwim.so.15");
+const EMBEDDED_LIBNTFS_SO: &[u8] = include_bytes!("../../resources/wimtools/libntfs-3g.so.89");
+const EMBEDDED_LIBFUSE3_SO: &[u8] = include_bytes!("../../resources/wimtools/libfuse3.so.3");
 
 /// Extrait ou localise le binaire `wimlib-imagex` embarqué et ses bibliothèques partagées,
 /// et retourne `(chemin_wimlib_imagex, dossier_ld_library_path)`.
@@ -291,20 +289,6 @@ fn run_embedded_wimsplit(wim_src_str: &str, swm_dst_str: &str) -> AppResult<()> 
 /// Retourne toujours un binaire de découpage WIM valide (embarqué dans l'application ou système).
 fn find_wimsplit_binary() -> Option<&'static str> {
     Some("wimlib-imagex (embarqué)")
-}
-
-/// Vérifie les outils système disponibles sur l'hôte.
-pub fn check_system_capabilities() -> SystemCapabilities {
-    let embedded_ok = ensure_embedded_wimtools().is_ok();
-    SystemCapabilities {
-        pkexec: has_command("pkexec"),
-        lsblk: has_command("lsblk"),
-        parted: has_command("parted") || has_command("sfdisk"),
-        mkfs_vfat: has_command("mkfs.vfat"),
-        mkfs_ntfs: has_command("mkfs.ntfs"),
-        seven_zip: has_command("7z"),
-        wimlib_imagex: embedded_ok || has_command("wimlib-imagex"),
-    }
 }
 
 /// Nettoie et normalise un label de volume pour FAT32 / NTFS (max 11 caractères ASCII majuscules).
@@ -443,10 +427,10 @@ pub fn inspect_iso_file(iso_path: &str) -> AppResult<IsoInspection> {
                 if ident == b"CD001" {
                     is_iso9660 = true;
                     if sector[0] == 1 && raw_volume_label.is_empty() {
-                        raw_volume_label = String::from_utf8_lossy(&sector[40..72])
-                            .trim()
-                            .to_string();
-                    } else if sector[0] == 0 && sector[7..30].starts_with(b"EL TORITO SPECIFICATION")
+                        raw_volume_label =
+                            String::from_utf8_lossy(&sector[40..72]).trim().to_string();
+                    } else if sector[0] == 0
+                        && sector[7..30].starts_with(b"EL TORITO SPECIFICATION")
                     {
                         has_el_torito = true;
                     }
@@ -586,7 +570,7 @@ impl Drop for StagedWorkerGuard {
 /// Prépare la ligne de commande du worker privilégié pour `pkexec`.
 ///
 /// Lorsqu'il est exécuté depuis une `.AppImage`, `std::env::current_exe()` pointe vers
-/// `/tmp/.mount_Noos-FXXXXXX/usr/bin/noos-win-installer`, un système de fichiers FUSE monté par
+/// `/tmp/.mount_Noos-FXXXXXX/usr/bin/noos-flasher`, un système de fichiers FUSE monté par
 /// l'utilisateur courant auquel `root` (`pkexec`, `euid = 0`) n'a pas accès (`EACCES: Permission denied`).
 /// Cette fonction copie alors l'exécutable dans `/tmp` (ou `/var/tmp` si `/tmp` est monté en `noexec`),
 /// vérifie son exécution autonome via `--privileged-worker-check` et replie sur `--appimage-extract-and-run`
@@ -689,11 +673,12 @@ fn prepare_privileged_worker_invocation(
     ))
 }
 
-/// Lance le processus de flashage en tâche de fond via `pkexec` et relaie la progression temps réel au frontend Tauri.
+/// Lance le processus de flashage via `pkexec` et relaie la progression temps réel
+/// à l'interface graphique au moyen du callback `progress`.
 pub async fn execute_flash_with_pkexec(
-    app: AppHandle,
     config: FlashJobConfig,
     cancel_flag: Arc<AtomicBool>,
+    progress: ProgressCallback,
 ) -> AppResult<()> {
     // 1. Validation de sécurité côté utilisateur avant même d'appeler pkexec
     let validated_drive = validate_target_device(&config.device_path)?;
@@ -733,23 +718,20 @@ pub async fn execute_flash_with_pkexec(
     let (pkexec_args, _staged_worker_guard) =
         prepare_privileged_worker_invocation(&current_exe, &job_json)?;
 
-    let _ = app.emit(
-        "flash-progress",
-        FlashProgressEvent {
-            stage: "Demande d'élévation de privilèges PolicyKit (pkexec)...".to_string(),
-            percent: 0.0,
-            speed_mbps: 0.0,
-            bytes_processed: 0,
-            total_bytes: inspected_iso.size_bytes,
-            eta_seconds: None,
-            log: Some(format!(
-                "Authentification Polkit requise pour écrire sur {} ({} {})",
-                validated_drive.path, validated_drive.vendor, validated_drive.model
-            )),
-            completed: false,
-            error: None,
-        },
-    );
+    progress(FlashProgressEvent {
+        stage: "Demande d'élévation de privilèges PolicyKit (pkexec)...".to_string(),
+        percent: 0.0,
+        speed_mbps: 0.0,
+        bytes_processed: 0,
+        total_bytes: inspected_iso.size_bytes,
+        eta_seconds: None,
+        log: Some(format!(
+            "Authentification Polkit requise pour écrire sur {} ({} {})",
+            validated_drive.path, validated_drive.vendor, validated_drive.model
+        )),
+        completed: false,
+        error: None,
+    });
 
     // 2. Exécution sécurisée sans sous-shell (zéro bash -c) via pkexec vers notre propre binaire en mode worker.
     // On fixe le dossier de travail sur /tmp et on purge les variables d'environnement AppImage/FUSE
@@ -804,23 +786,20 @@ pub async fn execute_flash_with_pkexec(
                                 if let Some(ref err) = event.error {
                                     last_error_msg = err.clone();
                                 }
-                                let _ = app.emit("flash-progress", event);
+                                progress(event);
                             }
                         } else if !line.trim().is_empty() {
-                            let _ = app.emit(
-                                "flash-progress",
-                                FlashProgressEvent {
-                                    stage: "Opération en cours...".to_string(),
-                                    percent: 0.0,
-                                    speed_mbps: 0.0,
-                                    bytes_processed: 0,
-                                    total_bytes: inspected_iso.size_bytes,
-                                    eta_seconds: None,
-                                    log: Some(line),
-                                    completed: false,
-                                    error: None,
-                                },
-                            );
+                            progress(FlashProgressEvent {
+                                stage: "Opération en cours...".to_string(),
+                                percent: 0.0,
+                                speed_mbps: 0.0,
+                                bytes_processed: 0,
+                                total_bytes: inspected_iso.size_bytes,
+                                eta_seconds: None,
+                                log: Some(line),
+                                completed: false,
+                                error: None,
+                            });
                         }
                     }
                     Ok(None) => break,
@@ -884,7 +863,7 @@ pub async fn execute_flash_with_pkexec(
 // LOGIQUE DU WORKER PRIVILÉGIÉ (EXÉCUTÉ EN ROOT VIA PKEXEC)
 // ============================================================================
 
-/// Émet un événement JSON structuré sur `stdout` à destination du processus Tauri parent.
+/// Émet un événement JSON structuré sur `stdout` à destination du processus parent.
 fn emit_worker_event(event: &FlashProgressEvent) {
     if let Ok(serialized) = serde_json::to_string(event) {
         println!("{PROGRESS_PREFIX}{serialized}");
@@ -1290,7 +1269,10 @@ fn run_windows_uefi_flash(
         error: None,
     });
 
-    run_checked_command("parted", &["-s", &config.device_path, "mklabel", scheme_label])?;
+    run_checked_command(
+        "parted",
+        &["-s", &config.device_path, "mklabel", scheme_label],
+    )?;
     run_checked_command(
         "parted",
         &[
@@ -1333,7 +1315,10 @@ fn run_windows_uefi_flash(
             }
         }
         PartitionScheme::Mbr => {
-            let _ = run_checked_command("parted", &["-s", &config.device_path, "set", "1", "boot", "on"]);
+            let _ = run_checked_command(
+                "parted",
+                &["-s", &config.device_path, "set", "1", "boot", "on"],
+            );
         }
     }
 
@@ -1390,10 +1375,14 @@ fn run_windows_uefi_flash(
             )?;
         }
         FileSystemType::Ntfs => {
-            run_checked_command(
-                "mkfs.ntfs",
-                &["-Q", "-L", &config.volume_label, &part_path],
-            )?;
+            // `mkfs.ntfs` est fourni par ntfsprogs ; certains systèmes
+            // n'exposent que `mkntfs` (même paquet, symlink absent).
+            let mkfs_ntfs = if has_command("mkfs.ntfs") {
+                "mkfs.ntfs"
+            } else {
+                "mkntfs"
+            };
+            run_checked_command(mkfs_ntfs, &["-Q", "-L", &config.volume_label, &part_path])?;
         }
     }
 
@@ -1409,12 +1398,12 @@ fn run_windows_uefi_flash(
         iso_mnt: iso_mnt.clone(),
     };
 
-    let iso_mnt_str = iso_mnt.to_str().ok_or_else(|| {
-        AppError::Other(anyhow::anyhow!("Chemin temporaire ISO invalide"))
-    })?;
-    let usb_mnt_str = usb_mnt.to_str().ok_or_else(|| {
-        AppError::Other(anyhow::anyhow!("Chemin temporaire USB invalide"))
-    })?;
+    let iso_mnt_str = iso_mnt
+        .to_str()
+        .ok_or_else(|| AppError::Other(anyhow::anyhow!("Chemin temporaire ISO invalide")))?;
+    let usb_mnt_str = usb_mnt
+        .to_str()
+        .ok_or_else(|| AppError::Other(anyhow::anyhow!("Chemin temporaire USB invalide")))?;
 
     emit_worker_event(&FlashProgressEvent {
         stage: "Montage de l'image ISO et du volume USB...".to_string(),
@@ -1443,7 +1432,8 @@ fn run_windows_uefi_flash(
     let mut total_copy_bytes: u64 = 0;
 
     for entry_res in WalkDir::new(&iso_mnt).follow_links(false) {
-        let entry = entry_res.map_err(|e| AppError::Other(anyhow::anyhow!("Erreur WalkDir: {e}")))?;
+        let entry =
+            entry_res.map_err(|e| AppError::Other(anyhow::anyhow!("Erreur WalkDir: {e}")))?;
         let src_path = entry.path();
         let rel_path = src_path
             .strip_prefix(&iso_mnt)
@@ -1453,7 +1443,10 @@ fn run_windows_uefi_flash(
             continue;
         }
 
-        let rel_lower = rel_path.to_string_lossy().replace('\\', "/").to_ascii_lowercase();
+        let rel_lower = rel_path
+            .to_string_lossy()
+            .replace('\\', "/")
+            .to_ascii_lowercase();
         let dst_path = if rel_lower == "efi/boot/bootx64.efi" {
             efi_boot_dir.join("BOOTX64.EFI")
         } else if rel_lower == "efi/boot/bootia32.efi" {
@@ -1606,12 +1599,12 @@ fn run_windows_uefi_flash(
             error: None,
         });
 
-        let wim_src_str = wim_src_path.to_str().ok_or_else(|| {
-            AppError::Other(anyhow::anyhow!("Chemin install.wim invalide"))
-        })?;
-        let swm_dst_str = swm_dst_path.to_str().ok_or_else(|| {
-            AppError::Other(anyhow::anyhow!("Chemin install.swm invalide"))
-        })?;
+        let wim_src_str = wim_src_path
+            .to_str()
+            .ok_or_else(|| AppError::Other(anyhow::anyhow!("Chemin install.wim invalide")))?;
+        let swm_dst_str = swm_dst_path
+            .to_str()
+            .ok_or_else(|| AppError::Other(anyhow::anyhow!("Chemin install.swm invalide")))?;
 
         run_embedded_wimsplit(wim_src_str, swm_dst_str)?;
 
@@ -1662,7 +1655,10 @@ fn run_windows_uefi_flash(
         bytes_processed: copied_bytes,
         total_bytes: total_iso_bytes,
         eta_seconds: Some(3),
-        log: Some("Synchronisation des écritures et démontage propre de la clé USB (sync + umount)...".to_string()),
+        log: Some(
+            "Synchronisation des écritures et démontage propre de la clé USB (sync + umount)..."
+                .to_string(),
+        ),
         completed: false,
         error: None,
     });
@@ -1748,8 +1744,73 @@ mod tests {
     }
 
     #[test]
+    fn test_sanitize_volume_label_filters_and_truncates() {
+        assert_eq!(sanitize_volume_label("my usb!", "NOOS_USB"), "MYUSB");
+        assert_eq!(
+            sanitize_volume_label("abcdefghijklmnop", "NOOS_USB"),
+            "ABCDEFGHIJK"
+        );
+        assert_eq!(sanitize_volume_label("", "NOOS_USB"), "NOOS_USB");
+        assert_eq!(sanitize_volume_label("éàç", "NOOS_USB"), "NOOS_USB");
+    }
+
+    #[test]
+    fn test_inspect_raw_img_detection() {
+        let path = std::env::temp_dir().join(format!(
+            "noos_flasher_raw_image_test_{}.img",
+            std::process::id()
+        ));
+        let mut data = vec![0u8; 2 * 1024 * 1024];
+        // Signature MBR + une entrée de partition non vide.
+        data[510] = 0x55;
+        data[511] = 0xAA;
+        data[446] = 0x80;
+        fs::write(&path, &data).expect("écriture image de test");
+
+        let inspection =
+            inspect_iso_file(path.to_str().expect("chemin UTF-8")).expect("inspection image brute");
+        assert_eq!(inspection.kind, IsoKind::RawImage);
+        assert_eq!(inspection.recommended_mode, FlashMode::LinuxDd);
+        assert_eq!(inspection.recommended_fs, FileSystemType::Fat32);
+        assert!(inspection.size_bytes >= 2 * 1024 * 1024);
+
+        fs::remove_file(&path).expect("nettoyage image de test");
+    }
+
+    #[test]
+    #[ignore = "nécessite NOOS_TEST_ISO=/chemin/vers/image.iso"]
+    fn test_inspect_iso_from_env() {
+        let Ok(path) = std::env::var("NOOS_TEST_ISO") else {
+            eprintln!("NOOS_TEST_ISO non défini, test ignoré");
+            return;
+        };
+        let inspection = inspect_iso_file(&path).expect("inspection de l'image réelle");
+        println!("{inspection:#?}");
+        assert!(!inspection.file_name.is_empty());
+        assert!(inspection.size_bytes > 1024 * 1024);
+    }
+
+    #[test]
+    fn test_inspect_iso_rejects_missing_and_tiny_files() {
+        let missing = std::env::temp_dir().join("noos_flasher_missing_test.iso");
+        let _ = fs::remove_file(&missing);
+        assert!(inspect_iso_file(missing.to_str().expect("chemin UTF-8")).is_err());
+
+        let tiny =
+            std::env::temp_dir().join(format!("noos_flasher_tiny_test_{}.iso", std::process::id()));
+        fs::write(&tiny, b"not an iso").expect("écriture fichier de test");
+        assert!(inspect_iso_file(tiny.to_str().expect("chemin UTF-8")).is_err());
+        fs::remove_file(&tiny).expect("nettoyage fichier de test");
+    }
+
+    #[test]
     fn test_prepare_privileged_worker_stages_outside_fuse_and_cleans_up() {
         let fake_fuse_dir = PathBuf::from(format!("/tmp/noos_test_fuse_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&fake_fuse_dir);
+        let _ = fs::remove_file(format!(
+            "/tmp/noos_privileged_worker_{}",
+            std::process::id()
+        ));
         fs::create_dir_all(&fake_fuse_dir).unwrap();
         let fake_exe = fake_fuse_dir.join("fake-worker.sh");
         fs::write(&fake_exe, "#!/bin/sh\nexit 0\n").unwrap();
@@ -1775,4 +1836,3 @@ mod tests {
         let _ = fs::remove_dir_all(&fake_fuse_dir);
     }
 }
-

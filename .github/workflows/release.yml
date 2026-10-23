@@ -9,71 +9,132 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: "Version du tag de release (ex: v0.1.3)"
+        description: "Version du tag de release (ex: v0.2.0)"
         required: true
-        default: "v0.1.3"
+        default: "v0.2.0"
 
 permissions:
   contents: write
 
 jobs:
   build-linux-bundles:
-    name: "Compiler et Empaqueter (.deb, .rpm, .AppImage)"
+    name: "Compiler et empaqueter (.deb, .rpm, .AppImage)"
     runs-on: ubuntu-24.04
     steps:
-      - name: 📥 Récupération du dépôt
+      - name: "Récupération du dépôt"
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
 
-      - name: 📦 Installation des dépendances système Linux (WebKit2GTK 4.1, RPM, AppImage)
+      - name: "Installation des dépendances système (GTK4, Libadwaita, outils USB/NTFS)"
         run: |
           sudo apt-get update
           sudo apt-get install -y \
-            libwebkit2gtk-4.1-dev \
-            libgtk-3-dev \
-            libayatana-appindicator3-dev \
+            build-essential \
+            pkg-config \
+            libgtk-4-dev \
+            libadwaita-1-dev \
+            libglib2.0-dev \
+            libgdk-pixbuf-2.0-dev \
             librsvg2-dev \
+            desktop-file-utils \
             patchelf \
             rpm \
+            fakeroot \
             file \
             wget \
             curl \
             libfuse2t64 \
+            parted \
+            dosfstools \
             ntfs-3g \
-            desktop-file-utils \
+            p7zip-full \
+            policykit-1 \
             xdg-utils
+          # Debian/Ubuntu : le paquet `ntfs-3g` fournit aussi mkntfs/ntfsfix
+          # (l'ancien paquet `ntfsprogs` a été fusionné dedans).
+          if apt-cache show ntfsprogs >/dev/null 2>&1; then
+            sudo apt-get install -y ntfsprogs
+          fi
 
-      - name: 🟢 Configuration de Node.js
-        uses: actions/setup-node@v4
-        with:
-          node-version: "20"
-
-      - name: 🦀 Configuration de la chaîne Rust Stable
+      - name: "Configuration de la chaîne Rust Stable"
         uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
 
-      - name: ⚡ Cache Cargo Rust
+      - name: "Cache Cargo"
         uses: Swatinem/rust-cache@v2
         with:
-          workspaces: "./src-tauri -> target"
+          workspaces: "."
 
-      - name: 📦 Installation du CLI Tauri v2
-        run: npm install
-
-      - name: 🔨 Compilation Tauri v2 (.deb, .rpm, .AppImage)
-        env:
-          NO_STRIP: true
-          APPIMAGE_EXTRACT_AND_RUN: 1
+      - name: "Vérifications (format, Clippy, tests, dépendances runtime)"
         run: |
-          npx tauri build --bundles deb,rpm,appimage
+          cargo fmt --check
+          cargo clippy --all-targets -- -D warnings
+          cargo test --locked
+          for bin in pkexec parted mkfs.vfat mkfs.ntfs ntfsfix ntfs-3g; do
+            command -v "$bin" >/dev/null || {
+              echo "Dépendance runtime manquante : $bin" >&2
+              exit 1
+            }
+          done
 
-      - name: 📋 Collecte des paquets et calcul des empreintes SHA-256
+      - name: "Compilation release"
+        run: cargo build --release --locked
+
+      - name: "Installation des outils d'empaquetage"
+        run: |
+          cargo install cargo-deb cargo-generate-rpm --locked
+
+      - name: "Génération des paquets .deb et .rpm"
+        run: |
+          cargo deb --no-build --no-strip
+          cargo generate-rpm
+
+      - name: "Génération de l'AppImage (GTK4 + Libadwaita)"
+        env:
+          APPIMAGE_EXTRACT_AND_RUN: 1
+          DEPLOY_GTK_VERSION: "4"
+        run: |
+          mkdir -p AppDir/usr/bin
+          mkdir -p AppDir/usr/share/applications
+          mkdir -p AppDir/usr/share/icons/hicolor/32x32/apps
+          mkdir -p AppDir/usr/share/icons/hicolor/64x64/apps
+          mkdir -p AppDir/usr/share/icons/hicolor/128x128/apps
+          mkdir -p AppDir/usr/share/icons/hicolor/256x256/apps
+          mkdir -p AppDir/usr/share/icons/hicolor/512x512/apps
+
+          install -Dm755 target/release/noos-flasher AppDir/usr/bin/noos-flasher
+          install -Dm644 packaging/io.github.chomiam.NoosFlasher.desktop \
+            AppDir/usr/share/applications/io.github.chomiam.NoosFlasher.desktop
+          install -Dm644 assets/icons/noos-flasher-32.png \
+            AppDir/usr/share/icons/hicolor/32x32/apps/io.github.chomiam.NoosFlasher.png
+          install -Dm644 assets/icons/noos-flasher-64.png \
+            AppDir/usr/share/icons/hicolor/64x64/apps/io.github.chomiam.NoosFlasher.png
+          install -Dm644 assets/icons/noos-flasher-128.png \
+            AppDir/usr/share/icons/hicolor/128x128/apps/io.github.chomiam.NoosFlasher.png
+          install -Dm644 assets/icons/noos-flasher-256.png \
+            AppDir/usr/share/icons/hicolor/256x256/apps/io.github.chomiam.NoosFlasher.png
+          install -Dm644 assets/icons/noos-flasher-512.png \
+            AppDir/usr/share/icons/hicolor/512x512/apps/io.github.chomiam.NoosFlasher.png
+
+          wget -q -c "https://github.com/linuxdeploy/linuxdeploy/releases/download/continuous/linuxdeploy-x86_64.AppImage"
+          wget -q -c "https://raw.githubusercontent.com/linuxdeploy/linuxdeploy-plugin-gtk/master/linuxdeploy-plugin-gtk.sh"
+          chmod +x linuxdeploy-x86_64.AppImage linuxdeploy-plugin-gtk.sh
+
+          LINUXDEPLOY="$PWD/linuxdeploy-x86_64.AppImage" \
+          DEPLOY_GTK_VERSION=4 \
+          ./linuxdeploy-x86_64.AppImage --appdir AppDir --plugin gtk --output appimage \
+            --desktop-file AppDir/usr/share/applications/io.github.chomiam.NoosFlasher.desktop \
+            --icon-file assets/icons/noos-flasher-512.png
+
+      - name: "Collecte des artefacts et empreintes SHA-256"
         id: artifacts
         run: |
           mkdir -p release-assets
-          cp src-tauri/target/release/bundle/deb/*.deb release-assets/
-          cp src-tauri/target/release/bundle/rpm/*.rpm release-assets/
-          cp src-tauri/target/release/bundle/appimage/*.AppImage release-assets/
+          cp target/debian/*.deb release-assets/ 2>/dev/null || cp target/*.deb release-assets/
+          cp target/generate-rpm/*.rpm release-assets/
+          cp ./*.AppImage release-assets/
           cd release-assets
           sha256sum *.deb *.rpm *.AppImage > SHA256SUMS.txt
           cat SHA256SUMS.txt
@@ -83,39 +144,31 @@ jobs:
           elif [[ "${{ github.ref }}" == refs/tags/* ]]; then
             TAG="${{ github.ref_name }}"
           else
-            TAG="v0.1.3"
+            TAG="v0.2.0"
           fi
           echo "TAG=$TAG" >> "$GITHUB_OUTPUT"
 
-      - name: 🚀 Publication de la Release GitHub (.deb, .rpm, .AppImage)
+      - name: "Publication de la release GitHub"
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ steps.artifacts.outputs.TAG }}
-          name: "Noos Flasher ${{ steps.artifacts.outputs.TAG }} — Linux (.deb, .rpm, .AppImage)"
+          name: "Noos Flasher ${{ steps.artifacts.outputs.TAG }} — Linux (GTK4)"
           body: |
-            ## ⚡ Noos Flasher ${{ steps.artifacts.outputs.TAG }} — Créateur de clés USB Bootables Linux & Windows UEFI
+            ## Noos Flasher ${{ steps.artifacts.outputs.TAG }} — Créateur de clés USB bootables Linux & Windows UEFI
 
-            Outil desktop natif **Rust + Tauri v2** pour Linux (Arch Linux, Pop!_OS, Ubuntu, Debian, Fedora) permettant de créer des clés USB bootables **Linux (Mode DD)** et **Windows 10/11 UEFI** avec studio de personnalisation et Debloat intégré.
+            Interface native **GTK4 / Libadwaita** (remplace le frontend Tauri v2), backend Rust conservé pour l'inspection ISO, l'écriture DD, le partitionnement Windows UEFI et le Debloat Studio.
 
-            ### 🛠️ Nouveautés & Correctifs (${{ steps.artifacts.outputs.TAG }}) :
-            - 📦 **Inclusion de `libfuse3.so.3` dans `wimtools` embarqué** : correction de l'erreur `libfuse3.so.3: cannot open shared object file` lors du découpage `wimlib-imagex split` de `install.wim` (> 4 Gio en FAT32) sur les distributions récentes (Arch Linux avec `libfuse3.so.4`). Les outils `wimtools` embarqués (`wimlib-imagex`, `libwim.so.15`, `libntfs-3g.so.89`, `libfuse3.so.3`) ne dépendent désormais plus que de `libc.so.6`.
-            - 🔐 **Correction de l'élévation PolicyKit (`pkexec`) en mode `.AppImage`** : extraction et vérification automatique du worker privilégié hors du point de montage FUSE utilisateur (`/tmp/.mount_*`, inaccessible en `root` via `EACCES`), nettoyage des variables d'environnement AppImage (`LD_LIBRARY_PATH`, `GIO_MODULE_DIR`) et isolation par UID de `wimtools` (`/tmp/noos_embedded_wimtools_<uid>`).
-            - 🐧 **Support Arch Linux (AUR)** : ajout des métadonnées officielles `PKGBUILD` / `.SRCINFO` et publication sur l'Arch User Repository (`noos-win-installer`).
-            - 🩹 **Correction du crash Windows 11 24H2/25H2 à 58 % (`specialize`)** : double injection XML (`<Extensions>`) + `$OEM$` garantissant l'extraction de `noos_debloat.ps1` et `noos_firstlogon.ps1` depuis `C:\Windows\Panther\unattend.xml` même avec une image découpée (`install.swm`).
+            ### Dépendances livrées
+            - **`ntfs-3g`** et **`ntfsprogs`** sont déclarés dans les paquets Arch (`PKGBUILD`), RPM et dans les prérequis Debian (où `ntfs-3g` fournit `mkntfs`/`ntfsfix`).
+            - `parted`, `dosfstools`, `polkit` (`pkexec`) et `util-linux` restent requis.
+            - `7z` est optionnel ; `wimlib-imagex` est embarqué dans le binaire.
 
-            ### ✨ Fonctionnalités incluses :
-            - 🛡️ **Protection stricte des disques système** : exclusion automatique de `/`, `/boot`, `/home` et des disques NVMe/SATA internes.
-            - 🪟 **Mode Windows 10/11 UEFI autonome** : partitionnement GPT/MBR, formatage FAT32/NTFS et `wimlib-imagex` embarqué nativement dans le binaire pour le découpage automatique de `install.wim` (> 4 Gio) sans dépendance externe à installer.
-            - 👤 **Compte Local & OOBE Bypass** : génération automatique de `/autounattend.xml` (`BypassNRO`, création du compte Administrateur local pré-configuré, bypass TPM 2.0 / Secure Boot / RAM).
-            - 🧹 **Studio Debloat (22 patchs configurables)** : suppression de Microsoft Copilot, Windows Recall, Bing Search, Cortana, Widgets, OneDrive, bloatwares UWP, télémétrie `DiagTrack` et restauration du menu clic-droit classique Windows 10.
-            - 🔐 **Élévation PolicyKit (`pkexec`)** : l'interface graphique s'exécute sans privilèges root et délègue uniquement l'écriture bloc au worker privilégié.
-
-            ### 📦 Paquets disponibles :
-            - **Arch Linux (AUR)** : `yay -S noos-win-installer` / `paru -S noos-win-installer`
-            - **Debian / Ubuntu / Pop!_OS / Mint** : `.deb`
-            - **Fedora / RHEL / openSUSE** : `.rpm`
-            - **Universel Linux Portable** : `.AppImage`
-            - **Empreintes de vérification** : `SHA256SUMS.txt`
+            ### Paquets
+            - Arch Linux (AUR) : `yay -S noos-flasher`
+            - Debian / Ubuntu / Pop!_OS : `.deb`
+            - Fedora / RHEL / openSUSE : `.rpm`
+            - Universel : `.AppImage` (nécessite les outils système de l'hôte)
+            - Empreintes : `SHA256SUMS.txt`
           files: |
             release-assets/*.deb
             release-assets/*.rpm

@@ -1,0 +1,124 @@
+/* Noos Flasher — compléments GTK4 / Libadwaita */
+
+.app-brand {
+  font-weight: 800;
+  letter-spacing: 0.02em;
+}
+
+.section-title {
+  font-weight: 700;
+}
+
+.dim {
+  opacity: 0.68;
+}
+
+.mono {
+  font-family: "JetBrains Mono", "Fira Code", "Source Code Pro", monospace;
+}
+
+.pill {
+  padding: 3px 9px;
+  border-radius: 999px;
+  font-size: 0.78em;
+  font-weight: 700;
+}
+
+.pill.ok {
+  background: alpha(@accent_bg_color, 0.18);
+  color: @accent_color;
+}
+
+.pill.warn {
+  background: alpha(@warning_color, 0.18);
+  color: @warning_color;
+}
+
+.pill.neutral {
+  background: rgba(128, 128, 128, 0.14);
+}
+
+.pill.accent {
+  background: alpha(@accent_bg_color, 0.18);
+  color: @accent_color;
+}
+
+.pill.small {
+  font-size: 0.7em;
+  padding: 2px 7px;
+}
+
+.stage-title {
+  font-weight: 700;
+  font-size: 1.02em;
+}
+
+.status-idle {
+  opacity: 0.62;
+  font-weight: 600;
+}
+
+.status-running {
+  color: @accent_color;
+  font-weight: 700;
+}
+
+.status-success {
+  color: @success_color;
+  font-weight: 700;
+}
+
+.status-error {
+  color: @error_color;
+  font-weight: 700;
+}
+
+.progress-bar-success progress {
+  background-color: @success_color;
+}
+
+.progress-bar-error progress {
+  background-color: @error_color;
+}
+
+.log-view {
+  font-family: "JetBrains Mono", "Fira Code", "Source Code Pro", monospace;
+  font-size: 0.82em;
+}
+
+.code-view {
+  font-family: "JetBrains Mono", "Fira Code", "Source Code Pro", monospace;
+  font-size: 0.8em;
+}
+
+.warning-text {
+  color: @warning_color;
+}
+
+.error-text {
+  color: @error_color;
+}
+
+.card-box {
+  padding: 12px;
+}
+
+.summary-row {
+  margin-top: 4px;
+  margin-bottom: 4px;
+}
+
+.summary-label {
+  font-weight: 700;
+  opacity: 0.72;
+}
+
+.preset-button {
+  padding: 3px 9px;
+  min-height: 22px;
+  font-size: 0.82em;
+}
+
+.debloat-counter {
+  font-weight: 700;
+}
