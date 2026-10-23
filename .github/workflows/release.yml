@@ -36,6 +36,7 @@ jobs:
             libadwaita-1-dev \
             libglib2.0-dev \
             libgdk-pixbuf-2.0-dev \
+            libgirepository1.0-dev \
             librsvg2-dev \
             desktop-file-utils \
             patchelf \
