@@ -29,7 +29,7 @@ Il remplace le frontend Tauri v2 d'origine : le backend d'écriture, d'inspectio
 - Fenêtre native GNOME avec `AdwHeaderBar`, `AdwPreferencesGroup`, `AdwSwitchRow`, `AdwComboRow`, `AdwBanner`, `AdwToastOverlay` et `AdwMessageDialog`.
 - Sélection de l'ISO via `GtkFileDialog`, confirmation destructive native et aperçu des scripts dans un `AdwDialog`.
 - Le volet **Personnalisation Windows / Debloat** n'apparaît que lorsqu'une ISO réellement détectée comme installateur Windows est sélectionnée.
-- Progression temps réel, vitesse, ETA, journal copiable et annulation.
+- Progression pondérée par le volume total (copie + découpage WIM), vitesse, ETA, indicateur de dernière activité, journal périodique copiable et annulation.
 - Aucune dépendance à WebKitGTK, Node.js, npm ou Tauri.
 
 ### Dépendances système
