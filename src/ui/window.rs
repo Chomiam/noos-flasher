@@ -1440,6 +1440,9 @@ fn start_flash(ui: &Rc<Ui>, state: &Rc<RefCell<State>>) {
         ),
         LogLevel::Info,
     );
+    // Fait défiler la page jusqu'au journal pour que la progression et les
+    // messages restent visibles pendant toute l'opération.
+    ui.log_view.grab_focus();
 
     let (tx, rx) = async_channel::unbounded::<FlashMessage>();
     let progress_tx = tx.clone();
