@@ -199,6 +199,20 @@ pub fn has_command(bin: &str) -> bool {
     resolved.is_absolute() && resolved.is_file()
 }
 
+/// Vérifie qu'un outil système requis est présent avant de toucher au disque.
+fn ensure_command(bin: &str) -> AppResult<()> {
+    if has_command(bin) {
+        Ok(())
+    } else {
+        Err(AppError::CommandFailed {
+            cmd: bin.to_string(),
+            details: format!(
+                "L'outil requis '{bin}' est introuvable. Installez les dépendances du paquet noos-flasher (parted, dosfstools, ntfs-3g/ntfsprogs, util-linux)."
+            ),
+        })
+    }
+}
+
 /// Binaires `wimtools` (`wimlib-imagex` + `libwim.so.15` + `libntfs-3g.so.89` + `libfuse3.so.3`) embarqués directement
 /// dans l'exécutable Rust afin qu'aucun utilisateur Linux n'ait besoin d'installer `wimtools` ou `libfuse3.so.3` manuellement.
 const EMBEDDED_WIMLIB_BIN: &[u8] = include_bytes!("../../resources/wimtools/wimlib-imagex");
@@ -1202,6 +1216,7 @@ fn run_linux_dd_flash(
     config: &FlashJobConfig,
     partitions: &[crate::drive::DrivePartition],
 ) -> AppResult<()> {
+    ensure_command("umount")?;
     unmount_all_device_partitions(&config.device_path, partitions)?;
 
     let mut src_file = File::open(&config.iso_path)?;
@@ -1404,6 +1419,23 @@ fn run_windows_uefi_flash(
     config: &FlashJobConfig,
     partitions: &[crate::drive::DrivePartition],
 ) -> AppResult<()> {
+    // Préflight : on refuse de commencer à effacer la clé si un outil
+    // nécessaire au partitionnement/formatage est absent.
+    ensure_command("parted")?;
+    ensure_command("mount")?;
+    ensure_command("umount")?;
+    match config.fs_type {
+        FileSystemType::Fat32 => ensure_command("mkfs.vfat")?,
+        FileSystemType::Ntfs => {
+            if !has_command("mkfs.ntfs") && !has_command("mkntfs") {
+                return Err(AppError::CommandFailed {
+                    cmd: "mkfs.ntfs / mkntfs".to_string(),
+                    details: "Les outils NTFS de ntfsprogs sont introuvables.".to_string(),
+                });
+            }
+        }
+    }
+
     let total_iso_bytes = fs::metadata(&config.iso_path)?.len();
 
     // 1. Démontage et nettoyage des signatures existantes
@@ -1971,6 +2003,12 @@ mod tests {
             "wimlib-imagex --version failed: {}",
             String::from_utf8_lossy(&output.stderr)
         );
+    }
+
+    #[test]
+    fn test_ensure_command_detects_present_and_missing_binaries() {
+        assert!(ensure_command("lsblk").is_ok());
+        assert!(ensure_command("noos-flasher-command-that-does-not-exist").is_err());
     }
 
     #[test]
