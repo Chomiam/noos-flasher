@@ -773,6 +773,7 @@ fn prepare_privileged_worker_invocation(
     let is_fuse_or_appimage = exe_str.starts_with("/tmp/.mount_")
         || std::env::var_os("APPDIR").is_some()
         || std::env::var_os("APPIMAGE").is_some()
+        || !current_exe.exists()
         || (!exe_str.starts_with("/usr/")
             && !exe_str.starts_with("/opt/")
             && !exe_str.starts_with("/bin/")
@@ -790,10 +791,23 @@ fn prepare_privileged_worker_invocation(
         ));
     }
 
+    // Si le binaire a été remplacé ou supprimé pendant que l'application
+    // tournait (mise à jour, rebuild en développement), le chemin
+    // `current_exe` n'existe plus. `/proc/self/exe` pointe toujours vers
+    // l'inode du processus courant et permet de stager le worker.
+    let proc_exe = Path::new("/proc/self/exe");
+    let copy_source = if current_exe.exists() {
+        current_exe
+    } else if proc_exe.exists() {
+        proc_exe
+    } else {
+        current_exe
+    };
+
     let pid = std::process::id();
     for base_dir in ["/tmp", "/var/tmp"] {
         let staged_path = PathBuf::from(format!("{base_dir}/noos_privileged_worker_{pid}"));
-        if fs::copy(current_exe, &staged_path).is_ok() {
+        if fs::copy(copy_source, &staged_path).is_ok() {
             if let Ok(meta) = fs::metadata(&staged_path) {
                 let mut perms = meta.permissions();
                 perms.set_mode(0o755);
