@@ -3,6 +3,7 @@ use std::collections::HashSet;
 use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::time::Instant;
 
 use adw::prelude::*;
 use gtk::{gio, glib};
@@ -48,6 +49,7 @@ struct State {
     catalog: Vec<DebloatFeatureDescriptor>,
     enabled: HashSet<String>,
     is_flashing: bool,
+    last_progress_at: Instant,
     cancel_flag: Arc<AtomicBool>,
 }
 
@@ -66,6 +68,7 @@ impl State {
             catalog,
             enabled,
             is_flashing: false,
+            last_progress_at: Instant::now(),
             cancel_flag: Arc::new(AtomicBool::new(false)),
         }
     }
@@ -106,6 +109,7 @@ struct Ui {
     progress_speed: gtk::Label,
     progress_percent: gtk::Label,
     progress_bytes: gtk::Label,
+    progress_activity: gtk::Label,
     progress_status: gtk::Label,
     log_buffer: gtk::TextBuffer,
     log_view: gtk::TextView,
@@ -348,6 +352,9 @@ impl Ui {
         let progress_bytes = gtk::Label::new(Some("0.0 Mio / 0.0 Mio"));
         progress_bytes.set_xalign(0.0);
         progress_bytes.add_css_class("dim");
+        let progress_activity = gtk::Label::new(Some("Dernière activité : —"));
+        progress_activity.set_xalign(1.0);
+        progress_activity.add_css_class("dim");
         let progress_status = gtk::Label::new(Some("En attente"));
         progress_status.set_xalign(1.0);
         progress_status.add_css_class("status-idle");
@@ -355,6 +362,7 @@ impl Ui {
         let progress_subinfo = gtk::Box::new(gtk::Orientation::Horizontal, 8);
         progress_bytes.set_hexpand(true);
         progress_subinfo.append(&progress_bytes);
+        progress_subinfo.append(&progress_activity);
         progress_subinfo.append(&progress_status);
 
         let log_buffer = gtk::TextBuffer::new(None::<&gtk::TextTagTable>);
@@ -656,6 +664,7 @@ impl Ui {
             progress_speed,
             progress_percent,
             progress_bytes,
+            progress_activity,
             progress_status,
             log_buffer,
             log_view,
@@ -864,6 +873,30 @@ fn initial_load(ui: Rc<Ui>, state: Rc<RefCell<State>>) {
     render_iso_details(&ui, None, None);
     render_drive_details(&ui, &state.borrow());
     update_ready(&ui, &state.borrow());
+
+    // Indicateur de vivacité : même si un outil externe reste silencieux
+    // quelques secondes, l'utilisateur voit que le worker est toujours actif.
+    let timer_ui = ui.clone();
+    let timer_state = state.clone();
+    glib::timeout_add_seconds_local(1, move || {
+        let (is_flashing, seconds) = {
+            let st = timer_state.borrow();
+            (st.is_flashing, st.last_progress_at.elapsed().as_secs())
+        };
+        if is_flashing {
+            timer_ui
+                .progress_activity
+                .set_text(&format!("Dernière activité : {seconds} s"));
+            if seconds >= 5 {
+                timer_ui.progress_activity.add_css_class("warning-text");
+            } else {
+                timer_ui.progress_activity.remove_css_class("warning-text");
+            }
+        } else {
+            timer_ui.progress_activity.remove_css_class("warning-text");
+        }
+        glib::ControlFlow::Continue
+    });
 }
 
 fn refresh_drives(ui: &Rc<Ui>, state: &Rc<RefCell<State>>) {
@@ -1383,6 +1416,7 @@ fn start_flash(ui: &Rc<Ui>, state: &Rc<RefCell<State>>) {
     {
         let mut st = state.borrow_mut();
         st.is_flashing = true;
+        st.last_progress_at = Instant::now();
         st.cancel_flag.store(false, Ordering::SeqCst);
     }
 
@@ -1445,7 +1479,7 @@ fn start_flash(ui: &Rc<Ui>, state: &Rc<RefCell<State>>) {
     glib::spawn_future_local(async move {
         while let Ok(message) = rx.recv().await {
             match message {
-                FlashMessage::Progress(event) => apply_progress(&ui2, event),
+                FlashMessage::Progress(event) => apply_progress(&ui2, &state2, event),
                 FlashMessage::Finished(result) => {
                     finish_flash(&ui2, &state2, result);
                     break;
@@ -1458,6 +1492,7 @@ fn start_flash(ui: &Rc<Ui>, state: &Rc<RefCell<State>>) {
 fn reset_progress(ui: &Ui, total_bytes: u64) {
     ui.progress_stage.set_text("Initialisation du flashage…");
     ui.progress_eta.set_text("");
+    ui.progress_activity.set_text("Dernière activité : 0 s");
     ui.progress_speed.set_text("0.0 Mo/s");
     ui.progress_percent.set_text("0.0 %");
     ui.progress_bar.set_fraction(0.0);
@@ -1471,7 +1506,8 @@ fn reset_progress(ui: &Ui, total_bytes: u64) {
     set_status(ui, "En cours", "running");
 }
 
-fn apply_progress(ui: &Ui, event: FlashProgressEvent) {
+fn apply_progress(ui: &Ui, state: &Rc<RefCell<State>>, event: FlashProgressEvent) {
+    state.borrow_mut().last_progress_at = Instant::now();
     if !event.stage.is_empty() {
         ui.progress_stage.set_text(&event.stage);
     }
@@ -1521,6 +1557,8 @@ fn finish_flash(ui: &Rc<Ui>, state: &Rc<RefCell<State>>, result: Result<(), Stri
 
     ui.cancel_button.set_visible(false);
     ui.start_button.set_visible(true);
+    ui.progress_activity.set_text("");
+    ui.progress_activity.remove_css_class("warning-text");
     ui.refresh_button.set_sensitive(true);
     ui.browse_button.set_sensitive(true);
     ui.drive_combo.set_sensitive(true);

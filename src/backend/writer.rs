@@ -251,39 +251,208 @@ pub fn ensure_embedded_wimtools() -> AppResult<(PathBuf, PathBuf)> {
     Ok((bin_path, runtime_dir))
 }
 
-/// Exécute `wimlib-imagex split` en utilisant prioritairement la version embarquée autonome,
-/// avec repli automatique sur `wimlib-imagex` système s'il est installé.
-fn run_embedded_wimsplit(wim_src_str: &str, swm_dst_str: &str) -> AppResult<()> {
-    let (bin_path, lib_dir) = ensure_embedded_wimtools()?;
-    let output = Command::new(&bin_path)
-        .env("LD_LIBRARY_PATH", &lib_dir)
-        .args(["split", wim_src_str, swm_dst_str, "3800"])
-        .output()?;
+/// Formate une taille en Gio pour les messages de progression compacts.
+fn format_gib(bytes: u64) -> String {
+    format!("{:.2} Gio", bytes as f64 / (1024.0 * 1024.0 * 1024.0))
+}
 
-    if output.status.success() {
-        return Ok(());
+/// Interpole un pourcentage dans une plage donnée.
+fn progress_percent(processed: u64, total: u64, start: f64, end: f64) -> f64 {
+    start + (end - start) * (processed as f64 / total.max(1) as f64).clamp(0.0, 1.0)
+}
+
+/// Formate une durée en secondes pour les messages de progression.
+fn format_duration(seconds: u64) -> String {
+    if seconds >= 60 {
+        format!("{} min {:02} s", seconds / 60, seconds % 60)
+    } else {
+        format!("{seconds} s")
     }
+}
 
-    if has_command("wimlib-imagex") {
-        let sys_bin = resolve_command_path("wimlib-imagex");
-        if let Ok(sys_out) = Command::new(sys_bin)
-            .env_remove("LD_LIBRARY_PATH")
-            .args(["split", wim_src_str, swm_dst_str, "3800"])
-            .output()
-        {
-            if sys_out.status.success() {
-                return Ok(());
+/// Additionne la taille de tous les volumes `.swm` produits par `wimlib-imagex split`.
+fn sum_swm_parts(swm_dst: &str) -> u64 {
+    let path = Path::new(swm_dst);
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    let stem = path
+        .file_stem()
+        .and_then(|name| name.to_str())
+        .unwrap_or("install");
+    let ext = path
+        .extension()
+        .and_then(|ext| ext.to_str())
+        .unwrap_or("swm");
+
+    let mut total = 0u64;
+    if let Ok(entries) = fs::read_dir(parent) {
+        for entry in entries.flatten() {
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            if name.starts_with(stem) && name.ends_with(ext) {
+                total += entry.metadata().map(|meta| meta.len()).unwrap_or(0);
             }
         }
     }
+    total
+}
 
-    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
-    let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
-    let details = if !stderr.is_empty() { stderr } else { stdout };
-    Err(AppError::CommandFailed {
-        cmd: "wimlib-imagex split (embedded)".to_string(),
-        details,
-    })
+/// Exécute `wimlib-imagex split` en surveillant la taille des fichiers `.swm`
+/// produits pour émettre une progression réelle pendant le découpage.
+#[allow(clippy::too_many_arguments)]
+fn run_wimsplit_with_progress(
+    mut command: Command,
+    wim_src_str: &str,
+    swm_dst_str: &str,
+    wim_size: u64,
+    total_iso_bytes: u64,
+    base_bytes: u64,
+    start_percent: f64,
+    end_percent: f64,
+    label: &str,
+) -> AppResult<()> {
+    let mut child = command
+        .args(["split", wim_src_str, swm_dst_str, "3800"])
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()?;
+
+    let stderr = child.stderr.take().ok_or_else(|| {
+        AppError::Other(anyhow::anyhow!(
+            "Impossible de capturer stderr de wimlib-imagex split"
+        ))
+    })?;
+    let stderr_reader = thread::spawn(move || {
+        let mut reader = stderr;
+        let mut output = String::new();
+        let _ = reader.read_to_string(&mut output);
+        output
+    });
+
+    let started = Instant::now();
+    let mut last_emit = Instant::now() - Duration::from_secs(1);
+    let mut last_log = Instant::now();
+    let mut written = 0u64;
+
+    let status = loop {
+        match child.try_wait()? {
+            Some(status) => break status,
+            None => {
+                written = written.max(sum_swm_parts(swm_dst_str));
+                let now = Instant::now();
+                if now.duration_since(last_emit) >= Duration::from_millis(350) {
+                    let elapsed = started.elapsed().as_secs_f64().max(0.001);
+                    let percent = progress_percent(written, wim_size, start_percent, end_percent);
+                    let speed_mbps = (written as f64 / (1024.0 * 1024.0)) / elapsed;
+                    let remaining = wim_size.saturating_sub(written);
+                    let bytes_per_sec = written as f64 / elapsed;
+                    let eta =
+                        (bytes_per_sec > 1024.0).then(|| (remaining as f64 / bytes_per_sec) as u64);
+
+                    let log = (now.duration_since(last_log) >= Duration::from_secs(2)).then(|| {
+                        format!(
+                            "{label} : {:.1}% — {} / {} — {:.0} Mo/s — reste {}",
+                            percent,
+                            format_gib(written),
+                            format_gib(wim_size),
+                            speed_mbps,
+                            eta.map(format_duration)
+                                .unwrap_or_else(|| "calcul…".to_string())
+                        )
+                    });
+                    if log.is_some() {
+                        last_log = now;
+                    }
+
+                    emit_worker_event(&FlashProgressEvent {
+                        stage: "Découpage de install.wim via wimlib (FAT32)…".to_string(),
+                        percent,
+                        speed_mbps,
+                        bytes_processed: base_bytes.saturating_add(written),
+                        total_bytes: total_iso_bytes,
+                        eta_seconds: eta,
+                        log,
+                        completed: false,
+                        error: None,
+                    });
+                    last_emit = now;
+                }
+                thread::sleep(Duration::from_millis(200));
+            }
+        }
+    };
+
+    let stderr_output = stderr_reader.join().unwrap_or_default();
+
+    if status.success() {
+        Ok(())
+    } else {
+        let details = stderr_output.trim().to_string();
+        Err(AppError::CommandFailed {
+            cmd: format!("{label} split"),
+            details: if details.is_empty() {
+                format!(
+                    "wimlib-imagex s'est terminé avec le code {:?}",
+                    status.code()
+                )
+            } else {
+                details
+            },
+        })
+    }
+}
+
+/// Exécute `wimlib-imagex split` en utilisant prioritairement la version embarquée autonome,
+/// avec repli automatique sur `wimlib-imagex` système s'il est installé.
+#[allow(clippy::too_many_arguments)]
+fn run_embedded_wimsplit(
+    wim_src_str: &str,
+    swm_dst_str: &str,
+    wim_size: u64,
+    total_iso_bytes: u64,
+    base_bytes: u64,
+    start_percent: f64,
+    end_percent: f64,
+) -> AppResult<()> {
+    let (bin_path, lib_dir) = ensure_embedded_wimtools()?;
+    let mut command = Command::new(&bin_path);
+    command.env("LD_LIBRARY_PATH", &lib_dir);
+
+    match run_wimsplit_with_progress(
+        command,
+        wim_src_str,
+        swm_dst_str,
+        wim_size,
+        total_iso_bytes,
+        base_bytes,
+        start_percent,
+        end_percent,
+        "wimlib-imagex",
+    ) {
+        Ok(()) => Ok(()),
+        Err(embedded_error) => {
+            if has_command("wimlib-imagex") {
+                let sys_bin = resolve_command_path("wimlib-imagex");
+                let mut command = Command::new(sys_bin);
+                command.env_remove("LD_LIBRARY_PATH");
+                if run_wimsplit_with_progress(
+                    command,
+                    wim_src_str,
+                    swm_dst_str,
+                    wim_size,
+                    total_iso_bytes,
+                    base_bytes,
+                    start_percent,
+                    end_percent,
+                    "wimlib-imagex (système)",
+                )
+                .is_ok()
+                {
+                    return Ok(());
+                }
+            }
+            Err(embedded_error)
+        }
+    }
 }
 
 /// Retourne toujours un binaire de découpage WIM valide (embarqué dans l'application ou système).
@@ -1066,6 +1235,7 @@ fn run_linux_dd_flash(
     let mut bytes_since_last_sync: u64 = 0;
     let start_time = Instant::now();
     let mut last_emit = Instant::now();
+    let mut last_log = Instant::now();
 
     loop {
         let read_count = src_file.read(&mut buffer)?;
@@ -1102,6 +1272,22 @@ fn run_linux_dd_flash(
                 None
             };
 
+            let log = (now.duration_since(last_log) >= Duration::from_secs(2)).then(|| {
+                format!(
+                    "DD : {:.1}% — {} / {} — {:.0} Mo/s — reste {}",
+                    percent,
+                    format_gib(bytes_written),
+                    format_gib(total_bytes),
+                    speed_mbps,
+                    eta_seconds
+                        .map(format_duration)
+                        .unwrap_or_else(|| "calcul…".to_string())
+                )
+            });
+            if log.is_some() {
+                last_log = now;
+            }
+
             emit_worker_event(&FlashProgressEvent {
                 stage: "Écriture brute de l'image ISO (mode DD)...".to_string(),
                 percent,
@@ -1109,7 +1295,7 @@ fn run_linux_dd_flash(
                 bytes_processed: bytes_written,
                 total_bytes,
                 eta_seconds,
-                log: None,
+                log,
                 completed: false,
                 error: None,
             });
@@ -1480,16 +1666,20 @@ fn run_windows_uefi_flash(
         ));
     }
 
-    // 6. Copie streamée des fichiers de l'ISO avec vitesse Mo/s et progression temps réel
-    let copy_progress_span = if split_wim_source.is_some() {
-        62.0 // 18% -> 80% pour la copie, puis 80% -> 95% pour le split WIM
-    } else {
-        77.0 // 18% -> 95% pour la copie complète
-    };
+    // 6. Copie streamée des fichiers de l'ISO avec vitesse Mo/s et progression temps réel.
+    // La progression est pondérée par le volume total à traiter (copie + découpage WIM)
+    // afin d'éviter un saut brutal à 82 % avant les longues minutes de wimlib.
+    let split_wim_size = split_wim_source
+        .as_ref()
+        .map(|(_, size)| *size)
+        .unwrap_or(0);
+    let total_work_bytes = total_copy_bytes.saturating_add(split_wim_size);
+    let copy_percent = |processed: u64| progress_percent(processed, total_work_bytes, 18.0, 92.0);
 
     let mut copied_bytes: u64 = 0;
     let start_copy = Instant::now();
     let mut last_emit = Instant::now();
+    let mut last_log = Instant::now();
     let mut copy_buf = vec![0u8; 1024 * 1024]; // 1 Mio
 
     for (src_file_path, dst_file_path, _file_len) in &files_to_copy {
@@ -1514,15 +1704,17 @@ fn run_windows_uefi_flash(
         if is_notable_file {
             let elapsed = start_copy.elapsed().as_secs_f64().max(0.001);
             let speed = (copied_bytes as f64 / (1024.0 * 1024.0)) / elapsed;
-            let ratio = (copied_bytes as f64 / total_copy_bytes.max(1) as f64).clamp(0.0, 1.0);
             emit_worker_event(&FlashProgressEvent {
                 stage: format!("Extraction : {rel_display}"),
-                percent: 18.0 + ratio * copy_progress_span,
+                percent: copy_percent(copied_bytes),
                 speed_mbps: speed,
                 bytes_processed: copied_bytes,
                 total_bytes: total_iso_bytes,
                 eta_seconds: None,
-                log: Some(format!("Copie du fichier système : {rel_display}")),
+                log: Some(format!(
+                    "Copie du fichier système : {rel_display} ({:.1}%)",
+                    copy_percent(copied_bytes)
+                )),
                 completed: false,
                 error: None,
             });
@@ -1543,16 +1735,30 @@ fn run_windows_uefi_flash(
             if now.duration_since(last_emit) >= Duration::from_millis(150) {
                 let elapsed = start_copy.elapsed().as_secs_f64().max(0.001);
                 let speed_mbps = (copied_bytes as f64 / (1024.0 * 1024.0)) / elapsed;
-                let ratio = (copied_bytes as f64 / total_copy_bytes.max(1) as f64).clamp(0.0, 1.0);
-                let percent = 18.0 + ratio * copy_progress_span;
+                let percent = copy_percent(copied_bytes);
 
-                let rem = total_copy_bytes.saturating_sub(copied_bytes);
+                let rem = total_work_bytes.saturating_sub(copied_bytes);
                 let bps = copied_bytes as f64 / elapsed;
                 let eta = if bps > 1024.0 {
                     Some((rem as f64 / bps) as u64)
                 } else {
                     None
                 };
+
+                let log = (now.duration_since(last_log) >= Duration::from_secs(2)).then(|| {
+                    format!(
+                        "Copie : {:.1}% — {} / {} — {:.0} Mo/s — reste {}",
+                        percent,
+                        format_gib(copied_bytes),
+                        format_gib(total_work_bytes),
+                        speed_mbps,
+                        eta.map(format_duration)
+                            .unwrap_or_else(|| "calcul…".to_string())
+                    )
+                });
+                if log.is_some() {
+                    last_log = now;
+                }
 
                 emit_worker_event(&FlashProgressEvent {
                     stage: format!("Copie des fichiers Windows ({rel_display})..."),
@@ -1561,7 +1767,7 @@ fn run_windows_uefi_flash(
                     bytes_processed: copied_bytes,
                     total_bytes: total_iso_bytes,
                     eta_seconds: eta,
-                    log: None,
+                    log,
                     completed: false,
                     error: None,
                 });
@@ -1583,9 +1789,10 @@ fn run_windows_uefi_flash(
             fs::create_dir_all(parent)?;
         }
 
+        let split_start_percent = copy_percent(copied_bytes);
         emit_worker_event(&FlashProgressEvent {
             stage: "Découpage de install.wim (> 4 Gio) via wimlib pour FAT32...".to_string(),
-            percent: 82.0,
+            percent: split_start_percent,
             speed_mbps: 0.0,
             bytes_processed: copied_bytes,
             total_bytes: total_iso_bytes,
@@ -1606,9 +1813,32 @@ fn run_windows_uefi_flash(
             .to_str()
             .ok_or_else(|| AppError::Other(anyhow::anyhow!("Chemin install.swm invalide")))?;
 
-        run_embedded_wimsplit(wim_src_str, swm_dst_str)?;
+        run_embedded_wimsplit(
+            wim_src_str,
+            swm_dst_str,
+            wim_size,
+            total_iso_bytes,
+            copied_bytes,
+            split_start_percent,
+            92.0,
+        )?;
 
         copied_bytes += wim_size;
+
+        emit_worker_event(&FlashProgressEvent {
+            stage: "Découpage de install.wim terminé.".to_string(),
+            percent: 92.0,
+            speed_mbps: 0.0,
+            bytes_processed: copied_bytes,
+            total_bytes: total_iso_bytes,
+            eta_seconds: Some(2),
+            log: Some(format!(
+                "Découpage terminé : {} de volumes .swm générés.",
+                format_gib(wim_size)
+            )),
+            completed: false,
+            error: None,
+        });
     }
 
     // 7a. Vérification de secours : s'assurer que /EFI/BOOT/BOOTX64.EFI est bien présent
@@ -1741,6 +1971,31 @@ mod tests {
             "wimlib-imagex --version failed: {}",
             String::from_utf8_lossy(&output.stderr)
         );
+    }
+
+    #[test]
+    fn test_progress_percent_is_linear_and_clamped() {
+        assert_eq!(progress_percent(0, 1000, 18.0, 92.0), 18.0);
+        assert_eq!(progress_percent(500, 1000, 18.0, 92.0), 55.0);
+        assert_eq!(progress_percent(1000, 1000, 18.0, 92.0), 92.0);
+        assert_eq!(progress_percent(2000, 1000, 18.0, 92.0), 92.0);
+        assert_eq!(progress_percent(0, 0, 18.0, 92.0), 18.0);
+    }
+
+    #[test]
+    fn test_sum_swm_parts_tracks_split_outputs() {
+        let dir =
+            std::env::temp_dir().join(format!("noos_flasher_swm_test_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).expect("création dossier swm");
+        fs::write(dir.join("install.swm"), vec![0u8; 1000]).expect("écriture swm 1");
+        fs::write(dir.join("install2.swm"), vec![0u8; 2000]).expect("écriture swm 2");
+        fs::write(dir.join("unrelated.swm"), vec![0u8; 5000]).expect("écriture swm autre");
+        fs::write(dir.join("install.wim"), vec![0u8; 7000]).expect("écriture wim");
+
+        let target = dir.join("install.swm");
+        assert_eq!(sum_swm_parts(target.to_str().expect("chemin UTF-8")), 3000);
+        fs::remove_dir_all(&dir).expect("nettoyage dossier swm");
     }
 
     #[test]
