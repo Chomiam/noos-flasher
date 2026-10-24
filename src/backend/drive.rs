@@ -518,10 +518,12 @@ mod tests {
 
     #[test]
     fn test_usb_drive_accepted() {
+        // Nom fictif : évite qu'un runner CI dont la racine est montée sur
+        // /dev/sda soit interprété comme un montage critique.
         let usb_drive = LsblkDevice {
-            name: "sda".to_string(),
-            kname: Some("sda".to_string()),
-            path: Some("/dev/sda".to_string()),
+            name: "sdtest".to_string(),
+            kname: Some("sdtest".to_string()),
+            path: Some("/dev/sdtest".to_string()),
             model: Some("USB Flash Drive".to_string()),
             vendor: Some("Lexar".to_string()),
             size: 31_037_849_600,
