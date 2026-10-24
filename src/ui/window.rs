@@ -104,7 +104,6 @@ struct Ui {
     label_row: adw::EntryRow,
     wim_warning: gtk::Label,
     progress_stage: gtk::Label,
-    progress_eta: gtk::Label,
     progress_bar: gtk::ProgressBar,
     progress_speed: gtk::Label,
     progress_percent: gtk::Label,
@@ -143,6 +142,7 @@ pub fn present(app: &adw::Application, initial_iso: Option<String>) {
         .default_height(860)
         .build();
     window.set_size_request(940, 680);
+    window.set_icon_name(Some(APP_ID));
 
     let state = Rc::new(RefCell::new(State::new()));
     let ui = Rc::new(Ui::build(&window, &state));
@@ -319,9 +319,6 @@ impl Ui {
         let progress_stage = gtk::Label::new(Some("Prêt à flasher"));
         progress_stage.set_xalign(0.0);
         progress_stage.add_css_class("stage-title");
-        let progress_eta = gtk::Label::new(None);
-        progress_eta.set_xalign(0.0);
-        progress_eta.add_css_class("dim");
 
         let progress_speed = gtk::Label::new(Some("0.0 Mo/s"));
         progress_speed.add_css_class("pill");
@@ -333,7 +330,6 @@ impl Ui {
         let stage_box = gtk::Box::new(gtk::Orientation::Vertical, 2);
         stage_box.set_hexpand(true);
         stage_box.append(&progress_stage);
-        stage_box.append(&progress_eta);
 
         let metrics_box = gtk::Box::new(gtk::Orientation::Horizontal, 6);
         metrics_box.set_valign(gtk::Align::Center);
@@ -659,7 +655,6 @@ impl Ui {
             label_row,
             wim_warning,
             progress_stage,
-            progress_eta,
             progress_bar,
             progress_speed,
             progress_percent,
@@ -1494,7 +1489,6 @@ fn start_flash(ui: &Rc<Ui>, state: &Rc<RefCell<State>>) {
 
 fn reset_progress(ui: &Ui, total_bytes: u64) {
     ui.progress_stage.set_text("Initialisation du flashage…");
-    ui.progress_eta.set_text("");
     ui.progress_activity.set_text("Dernière activité : 0 s");
     ui.progress_speed.set_text("0.0 Mo/s");
     ui.progress_percent.set_text("0.0 %");
@@ -1514,7 +1508,6 @@ fn apply_progress(ui: &Ui, state: &Rc<RefCell<State>>, event: FlashProgressEvent
     if !event.stage.is_empty() {
         ui.progress_stage.set_text(&event.stage);
     }
-    ui.progress_eta.set_text(&format_eta(event.eta_seconds));
     ui.progress_speed
         .set_text(&format!("{:.1} Mo/s", event.speed_mbps));
     let percent = event.percent.clamp(0.0, 100.0);
@@ -1575,7 +1568,6 @@ fn finish_flash(ui: &Rc<Ui>, state: &Rc<RefCell<State>>, result: Result<(), Stri
             ui.progress_bar.set_fraction(1.0);
             ui.progress_percent.set_text("100.0 %");
             ui.progress_stage.set_text("Clé USB créée avec succès");
-            ui.progress_eta.set_text("");
             append_log(ui, "Flashage terminé avec succès.", LogLevel::Success);
             ui.toast
                 .add_toast(adw::Toast::new("Clé USB créée avec succès."));
@@ -1583,14 +1575,12 @@ fn finish_flash(ui: &Rc<Ui>, state: &Rc<RefCell<State>>, result: Result<(), Stri
         Err(err) if err.contains("annulée") => {
             set_status(ui, "Annulé", "idle");
             ui.progress_stage.set_text("Opération annulée");
-            ui.progress_eta.set_text("");
             append_log(ui, "Opération annulée par l'utilisateur.", LogLevel::Info);
             ui.toast.add_toast(adw::Toast::new("Opération annulée."));
         }
         Err(err) => {
             set_status(ui, "Erreur", "error");
             ui.progress_stage.set_text("Échec du flashage");
-            ui.progress_eta.set_text("");
             ui.progress_bar.add_css_class("progress-bar-error");
             append_log(ui, &format!("Échec du flashage : {err}"), LogLevel::Error);
             ui.toast.add_toast(adw::Toast::new("Échec du flashage."));
@@ -1808,19 +1798,5 @@ fn format_progress_bytes(bytes: u64) -> String {
         format!("{:.2} Gio", value / GIB)
     } else {
         format!("{:.1} Mio", value / MIB)
-    }
-}
-
-fn format_eta(seconds: Option<u64>) -> String {
-    match seconds {
-        Some(0) | None => String::new(),
-        Some(secs) if secs >= 60 => {
-            format!(
-                "Temps restant estimé : {} min {:02} s",
-                secs / 60,
-                secs % 60
-            )
-        }
-        Some(secs) => format!("Temps restant estimé : {secs} s"),
     }
 }

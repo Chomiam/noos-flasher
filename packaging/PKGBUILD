@@ -81,6 +81,8 @@ package() {
     "${pkgdir}/usr/share/icons/hicolor/256x256/apps/io.github.chomiam.NoosFlasher.png"
   install -Dm644 "assets/icons/noos-flasher-512.png" \
     "${pkgdir}/usr/share/icons/hicolor/512x512/apps/io.github.chomiam.NoosFlasher.png"
+  install -Dm644 "assets/icons/noos-flasher.svg" \
+    "${pkgdir}/usr/share/icons/hicolor/scalable/apps/io.github.chomiam.NoosFlasher.svg"
   install -Dm644 "LICENSE" "${pkgdir}/usr/share/licenses/${pkgname}/LICENSE"
   install -Dm644 "README.md" "${pkgdir}/usr/share/doc/${pkgname}/README.md"
 }

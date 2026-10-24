@@ -1,167 +1,105 @@
-# Noos Flasher
+<p align="center">
+  <img src="assets/branding/noos-logo.svg" alt="Noos" width="340">
+</p>
 
-**Noos Flasher** est un créateur de clés USB bootables **Linux (ISO hybride / DD)** et **Windows 10/11 UEFI**, développé en **Rust** avec une interface native **GTK4 / Libadwaita**.
+<h1 align="center">Noos Flasher</h1>
 
-Il remplace le frontend Tauri v2 d'origine : le backend d'écriture, d'inspection ISO, de partitionnement et de debloat Windows est conservé, tandis que l'interface est désormais une application GNOME native, sans WebView, sans Node.js et sans IPC JavaScript.
+<p align="center">
+  <strong>La façon la plus simple de créer une clé USB bootable pour Linux ou Windows 10/11.</strong>
+</p>
+
+<p align="center">
+  Une application native, rapide et sécurisée pour préparer vos clés USB sans ligne de commande.
+</p>
+
+<p align="center">
+  <a href="https://github.com/Chomiam/noos-flasher/releases/latest">
+    <img src="https://img.shields.io/badge/Télécharger-la%20dernière%20version-1c71d8?style=for-the-badge" alt="Télécharger">
+  </a>
+</p>
 
 ---
+
+<p align="center">
+  <img src="assets/screenshots/overview.png" alt="Noos Flasher — création d'une clé USB Windows 11" width="920">
+</p>
+
+## Une clé USB prête en quelques clics
+
+Noos Flasher détecte automatiquement le type d'image que vous avez choisi, configure les paramètres adaptés et vous guide jusqu'à la création de la clé. Aucun terminal, aucune commande à retenir.
+
+Que vous prépariez une installation Linux, une image disque ou un installateur Windows 11, l'interface reste claire, réactive et cohérente avec votre bureau GNOME.
+
+## Pourquoi Noos Flasher ?
+
+- **Interface native GTK4 / Libadwaita** — rapide, intégrée au bureau, sans WebView ni surcouche web.
+- **Détection intelligente des images** — ISO Linux hybrides, images `.img` et installateurs Windows UEFI sont reconnus automatiquement.
+- **Windows 11 simplifié** — contournement des vérifications TPM 2.0, Secure Boot, RAM et stockage, avec compte local préconfiguré.
+- **Debloat Studio** — 22 optimisations sélectionnables pour alléger Windows avant même la première utilisation.
+- **Sécurité par conception** — les disques internes et partitions système sont exclus, et l'écriture est déléguée à un service privilégié isolé via Polkit.
+- **Progression lisible** — pourcentage, vitesse, octets traités et journal détaillé en temps réel.
+- **NTFS pris en charge** — formatage NTFS et découpage automatique des gros `install.wim` pour FAT32.
 
 ## Fonctionnalités
 
-### Périphériques et sécurité
-- Détection des clés USB via `lsblk`, `/sys/block` et `/proc/mounts`.
-- Exclusion automatique de `/`, `/boot`, `/boot/efi`, `/home`, `/nix`, des disques NVMe/SATA/PCIe internes et des périphériques virtuels.
-- Double validation du périphérique cible côté utilisateur **et** dans le worker root lancé par `pkexec`.
+### Création de clés USB Linux
 
-### Images disque
-- Inspection binaire des signatures **MBR** (`0x55AA`), **GPT** (`EFI PART`), **ISO 9660** (`CD001`), **El Torito** et **UDF** (`NSR02`/`NSR03`).
-- Détection des installateurs Windows UEFI (`sources/install.wim`, `sources/boot.wim`, `bootmgr.efi`) et de la limite FAT32 de 4 Gio.
-- Mode **DD** pour les ISO Linux hybrides et les images `.img`, avec streaming par blocs de 4 Mio, mesure de vitesse et `sync` matériel.
+- Écriture directe (mode DD) des ISO hybrides et images disque.
+- Détection des signatures MBR, GPT, ISO 9660, El Torito et UDF.
+- Écriture par blocs avec synchronisation matérielle et mesure du débit.
+- Compatible avec les principales distributions Linux.
 
-### Windows 10/11 UEFI
-- Partitionnement **GPT** ou **MBR**, formatage **FAT32** ou **NTFS**.
-- Découpage automatique de `install.wim` en `.swm` (3800 Mio max) via `wimlib-imagex` **embarqué** dans le binaire, avec ses bibliothèques `libwim`, `libntfs-3g` et `libfuse3`.
-- Génération de `/autounattend.xml`, `noos_debloat.ps1` et `noos_firstlogon.ps1`.
-- **Debloat Studio** : 22 patchs configurables (Copilot, Recall, Bing, Cortana, Widgets, OneDrive, télémétrie, bloatwares UWP, menu contextuel classique, etc.).
-- Compte local administrateur pré-configuré, `BypassNRO`, bypass TPM/Secure Boot/RAM, langue française.
+### Création de clés USB Windows 10/11 UEFI
 
-### Interface GTK4 / Libadwaita
-- Fenêtre native GNOME avec `AdwHeaderBar`, `AdwPreferencesGroup`, `AdwSwitchRow`, `AdwComboRow`, `AdwBanner`, `AdwToastOverlay` et `AdwMessageDialog`.
-- Sélection de l'ISO via `GtkFileDialog`, confirmation destructive native et aperçu des scripts dans un `AdwDialog`.
-- Le volet **Personnalisation Windows / Debloat** n'apparaît que lorsqu'une ISO réellement détectée comme installateur Windows est sélectionnée.
-- Progression pondérée par le volume total (copie + découpage WIM), vitesse, ETA, indicateur de dernière activité, journal périodique copiable et annulation.
-- Aucune dépendance à WebKitGTK, Node.js, npm ou Tauri.
+- Partitionnement GPT ou MBR.
+- Formatage FAT32 ou NTFS.
+- Découpage automatique de `install.wim` en volumes `.swm` lorsque FAT32 est utilisé.
+- Injection d'un fichier `autounattend.xml` pour automatiser l'installation.
+- Compte administrateur local, connexion automatique, langue française et contournement de l'OOBE.
+- **Debloat Studio** : suppression de Copilot, Recall, Bing, Cortana, Widgets, OneDrive et bloatwares, réduction de la télémétrie, menu contextuel classique et optimisations de performances.
 
-### Dépendances système
-Noos Flasher s'appuie sur les outils système suivants, **livrés comme dépendances dans chaque paquet** :
+### Sécurité et fiabilité
 
-- **`ntfs-3g`** : support NTFS et `mount.ntfs-3g` ;
-- **`ntfsprogs`** : `mkfs.ntfs` / `mkntfs`, `ntfsfix` et utilitaires NTFS ;
-- `parted`, `dosfstools`, `polkit` (`pkexec`), `util-linux` ;
-- `7z` est optionnel (sonde rapide des métadonnées ISO) ;
-- `wimtools` n'est pas requis : `wimlib-imagex` est embarqué.
+- Les disques internes, NVMe, partitions système et volumes critiques ne peuvent pas être sélectionnés.
+- Double validation de la cible : côté interface et côté service privilégié.
+- Élévation de privilèges via `pkexec` ; l'application graphique ne tourne jamais en root.
+- Confirmation explicite avant toute opération destructive.
+- Journal d'opérations copiable et messages d'erreur détaillés.
 
-> Sur Debian/Ubuntu, l'ancien paquet `ntfsprogs` a été fusionné dans `ntfs-3g` : ce dernier fournit bien `mkntfs` et `ntfsfix`. Sur Arch Linux et Fedora, `ntfs-3g` et `ntfsprogs` sont deux paquets distincts et sont déclarés séparément.
+## Téléchargement
 
----
-
-## Installation
-
-### Arch Linux (AUR)
+### Arch Linux
 
 ```bash
 yay -S noos-flasher
-# ou
-paru -S noos-flasher
 ```
 
-Le paquet fournit `/usr/bin/noos-flasher`, le fichier `.desktop` et les icônes hicolor. Il remplace `noos-win-installer`.
+### Debian, Ubuntu, Pop!_OS, Fedora, openSUSE et autres distributions
 
-### Debian / Ubuntu / Pop!_OS
+Choisissez le format adapté à votre système depuis la page des releases :
 
-```bash
-sudo apt install parted dosfstools ntfs-3g polkit-1 7zip
-# puis installer le .deb fourni dans la release
-sudo apt install ./noos-flasher_*.deb
-```
+| Système | Format recommandé |
+| --- | --- |
+| Debian / Ubuntu / Pop!_OS / Mint | [Paquet `.deb`](https://github.com/Chomiam/noos-flasher/releases/latest) |
+| Fedora / RHEL / openSUSE | [Paquet `.rpm`](https://github.com/Chomiam/noos-flasher/releases/latest) |
+| Autres distributions Linux | [AppImage](https://github.com/Chomiam/noos-flasher/releases/latest) |
 
-### Fedora / openSUSE
+<p align="center">
+  <a href="https://github.com/Chomiam/noos-flasher/releases/latest">
+    <strong>Ouvrir la page des téléchargements →</strong>
+  </a>
+</p>
 
-```bash
-sudo dnf install parted dosfstools ntfs-3g ntfsprogs polkit
-sudo dnf install ./noos-flasher-*.rpm
-```
+## Une expérience pensée pour le bureau
 
-### AppImage
+Noos Flasher utilise les composants natifs de GNOME : barre de titre Libadwaita, groupes de préférences, sélecteurs, notifications et dialogues de confirmation. Le résultat est une application légère, cohérente avec le système, qui reste fluide même pendant l'écriture d'une image de plusieurs gigaoctets.
 
-L'AppImage est portable mais utilise les outils système de l'hôte (`pkexec`, `parted`, `mkfs.vfat`, `mkfs.ntfs`, `ntfs-3g`). Installez au minimum :
+Le volet de personnalisation Windows n'apparaît que lorsqu'une véritable ISO Windows est détectée : l'interface reste simple pour les images Linux et s'enrichit uniquement quand c'est utile.
 
-```bash
-sudo apt install parted dosfstools ntfs-3g polkit-1
-```
+## Contribuer
 
----
-
-## Compilation depuis les sources
-
-### Prérequis (Arch Linux)
-
-```bash
-sudo pacman -S --needed rust cargo gtk4 libadwaita \
-  parted dosfstools ntfs-3g ntfsprogs polkit util-linux 7zip
-```
-
-### Prérequis (Debian / Ubuntu)
-
-```bash
-sudo apt install build-essential pkg-config libgtk-4-dev libadwaita-1-dev \
-  parted dosfstools ntfs-3g polkit-1 7zip
-```
-
-### Compilation
-
-```bash
-git clone https://github.com/Chomiam/noos-flasher.git
-cd noos-flasher
-cargo build --release
-
-# Lancer l'interface
-./target/release/noos-flasher
-
-# Ouvrir directement une image (le volet Windows apparaît si l'ISO est un
-# installateur Windows 10/11)
-./target/release/noos-flasher ~/Téléchargements/Win11_24H2.iso
-```
-
-### Tests et qualité
-
-```bash
-cargo test
-cargo clippy --all-targets -- -D warnings
-cargo fmt --check
-```
-
-### Worker privilégié
-
-L'application graphique ne tourne jamais en root. Au démarrage du flashage, elle appelle :
-
-```bash
-pkexec /usr/bin/noos-flasher --privileged-worker --job-json '<json>'
-```
-
-Le worker est le même binaire, sans initialisation GTK. En mode AppImage, il est copié hors du montage FUSE utilisateur (`/tmp/.mount_*`) pour que `pkexec` puisse l'exécuter.
-
----
-
-## Structure du projet
-
-```text
-noos-flasher/
-├── Cargo.toml                  # Crate Rust, métadonnées .deb et .rpm
-├── assets/
-│   └── icons/                  # Icônes hicolor (32 → 512 px)
-├── packaging/
-│   ├── PKGBUILD                # Paquet Arch Linux / AUR
-│   ├── .SRCINFO
-│   └── io.github.chomiam.NoosFlasher.desktop
-├── resources/
-│   └── wimtools/               # wimlib-imagex + bibliothèques embarquées
-└── src/
-    ├── main.rs                 # Entrée GTK4 + mode --privileged-worker
-    ├── backend/
-    │   ├── mod.rs
-    │   ├── error.rs            # Erreurs typées (thiserror)
-    │   ├── drive.rs            # Détection et validation des disques USB
-    │   ├── writer.rs           # Inspection ISO, DD, Windows UEFI, pkexec
-    │   └── debloat.rs          # autounattend.xml + scripts PowerShell
-    └── ui/
-        ├── mod.rs              # Application GTK4 / Libadwaita
-        ├── window.rs           # Fenêtre, formulaires, progression, dialogues
-        └── style.css           # Styles complémentaires
-```
-
----
+Les rapports de bugs, suggestions et contributions sont les bienvenus sur [GitHub](https://github.com/Chomiam/noos-flasher/issues).
 
 ## Licence
 
-Distribué sous licence **MIT**. Voir [LICENSE](LICENSE).
+Noos Flasher est distribué sous licence **MIT**. Voir [LICENSE](LICENSE).

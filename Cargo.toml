@@ -64,6 +64,7 @@ assets = [
     ["assets/icons/noos-flasher-128.png", "usr/share/icons/hicolor/128x128/apps/io.github.chomiam.NoosFlasher.png", "644"],
     ["assets/icons/noos-flasher-256.png", "usr/share/icons/hicolor/256x256/apps/io.github.chomiam.NoosFlasher.png", "644"],
     ["assets/icons/noos-flasher-512.png", "usr/share/icons/hicolor/512x512/apps/io.github.chomiam.NoosFlasher.png", "644"],
+    ["assets/icons/noos-flasher.svg", "usr/share/icons/hicolor/scalable/apps/io.github.chomiam.NoosFlasher.svg", "644"],
     ["README.md", "usr/share/doc/noos-flasher/README.md", "644"],
     ["LICENSE", "usr/share/doc/noos-flasher/copyright", "644"],
 ]
@@ -84,6 +85,7 @@ assets = [
     { source = "assets/icons/noos-flasher-128.png", dest = "/usr/share/icons/hicolor/128x128/apps/io.github.chomiam.NoosFlasher.png", mode = "644" },
     { source = "assets/icons/noos-flasher-256.png", dest = "/usr/share/icons/hicolor/256x256/apps/io.github.chomiam.NoosFlasher.png", mode = "644" },
     { source = "assets/icons/noos-flasher-512.png", dest = "/usr/share/icons/hicolor/512x512/apps/io.github.chomiam.NoosFlasher.png", mode = "644" },
+    { source = "assets/icons/noos-flasher.svg", dest = "/usr/share/icons/hicolor/scalable/apps/io.github.chomiam.NoosFlasher.svg", mode = "644" },
     { source = "README.md", dest = "/usr/share/doc/noos-flasher/README.md", mode = "644" },
     { source = "LICENSE", dest = "/usr/share/licenses/noos-flasher/LICENSE", mode = "644", doc = true },
 ]

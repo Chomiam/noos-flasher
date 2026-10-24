@@ -160,7 +160,6 @@ pub struct FlashProgressEvent {
     pub speed_mbps: f64,
     pub bytes_processed: u64,
     pub total_bytes: u64,
-    pub eta_seconds: Option<u64>,
     pub log: Option<String>,
     pub completed: bool,
     pub error: Option<String>,
@@ -275,15 +274,6 @@ fn progress_percent(processed: u64, total: u64, start: f64, end: f64) -> f64 {
     start + (end - start) * (processed as f64 / total.max(1) as f64).clamp(0.0, 1.0)
 }
 
-/// Formate une durée en secondes pour les messages de progression.
-fn format_duration(seconds: u64) -> String {
-    if seconds >= 60 {
-        format!("{} min {:02} s", seconds / 60, seconds % 60)
-    } else {
-        format!("{seconds} s")
-    }
-}
-
 /// Additionne la taille de tous les volumes `.swm` produits par `wimlib-imagex split`.
 fn sum_swm_parts(swm_dst: &str) -> u64 {
     let path = Path::new(swm_dst);
@@ -357,20 +347,14 @@ fn run_wimsplit_with_progress(
                     let elapsed = started.elapsed().as_secs_f64().max(0.001);
                     let percent = progress_percent(written, wim_size, start_percent, end_percent);
                     let speed_mbps = (written as f64 / (1024.0 * 1024.0)) / elapsed;
-                    let remaining = wim_size.saturating_sub(written);
-                    let bytes_per_sec = written as f64 / elapsed;
-                    let eta =
-                        (bytes_per_sec > 1024.0).then(|| (remaining as f64 / bytes_per_sec) as u64);
 
                     let log = (now.duration_since(last_log) >= Duration::from_secs(2)).then(|| {
                         format!(
-                            "{label} : {:.1}% — {} / {} — {:.0} Mo/s — reste {}",
+                            "{label} : {:.1}% — {} / {} — {:.0} Mo/s",
                             percent,
                             format_gib(written),
                             format_gib(wim_size),
                             speed_mbps,
-                            eta.map(format_duration)
-                                .unwrap_or_else(|| "calcul…".to_string())
                         )
                     });
                     if log.is_some() {
@@ -383,7 +367,6 @@ fn run_wimsplit_with_progress(
                         speed_mbps,
                         bytes_processed: base_bytes.saturating_add(written),
                         total_bytes: total_iso_bytes,
-                        eta_seconds: eta,
                         log,
                         completed: false,
                         error: None,
@@ -921,7 +904,6 @@ pub async fn execute_flash_with_pkexec(
         speed_mbps: 0.0,
         bytes_processed: 0,
         total_bytes: inspected_iso.size_bytes,
-        eta_seconds: None,
         log: Some(format!(
             "Authentification Polkit requise pour écrire sur {} ({} {})",
             validated_drive.path, validated_drive.vendor, validated_drive.model
@@ -992,7 +974,6 @@ pub async fn execute_flash_with_pkexec(
                                 speed_mbps: 0.0,
                                 bytes_processed: 0,
                                 total_bytes: inspected_iso.size_bytes,
-                                eta_seconds: None,
                                 log: Some(line),
                                 completed: false,
                                 error: None,
@@ -1079,7 +1060,6 @@ pub fn run_privileged_worker_from_args(args: &[String]) -> i32 {
                 speed_mbps: 0.0,
                 bytes_processed: 0,
                 total_bytes: 0,
-                eta_seconds: None,
                 log: Some(format!("ERREUR : {err}")),
                 completed: false,
                 error: Some(err.to_string()),
@@ -1195,7 +1175,6 @@ fn unmount_all_device_partitions(
         speed_mbps: 0.0,
         bytes_processed: 0,
         total_bytes: 0,
-        eta_seconds: None,
         log: Some(format!(
             "Vérification et démontage des volumes montés sur {device_path}..."
         )),
@@ -1242,7 +1221,6 @@ fn run_linux_dd_flash(
         speed_mbps: 0.0,
         bytes_processed: 0,
         total_bytes,
-        eta_seconds: None,
         log: Some(format!(
             "Début du flashage DD de '{}' ({}) vers '{}'",
             config.iso_path,
@@ -1293,24 +1271,13 @@ fn run_linux_dd_flash(
             // Plage 2% -> 95% pour l'écriture, 95% -> 100% pour le sync final
             let percent = 2.0 + raw_ratio * 93.0;
 
-            let remaining_bytes = total_bytes.saturating_sub(bytes_written);
-            let bytes_per_sec = bytes_written as f64 / elapsed_secs;
-            let eta_seconds = if bytes_per_sec > 1024.0 {
-                Some((remaining_bytes as f64 / bytes_per_sec) as u64)
-            } else {
-                None
-            };
-
             let log = (now.duration_since(last_log) >= Duration::from_secs(2)).then(|| {
                 format!(
-                    "DD : {:.1}% — {} / {} — {:.0} Mo/s — reste {}",
+                    "DD : {:.1}% — {} / {} — {:.0} Mo/s",
                     percent,
                     format_gib(bytes_written),
                     format_gib(total_bytes),
                     speed_mbps,
-                    eta_seconds
-                        .map(format_duration)
-                        .unwrap_or_else(|| "calcul…".to_string())
                 )
             });
             if log.is_some() {
@@ -1323,7 +1290,6 @@ fn run_linux_dd_flash(
                 speed_mbps,
                 bytes_processed: bytes_written,
                 total_bytes,
-                eta_seconds,
                 log,
                 completed: false,
                 error: None,
@@ -1338,7 +1304,6 @@ fn run_linux_dd_flash(
         speed_mbps: 0.0,
         bytes_processed: bytes_written,
         total_bytes,
-        eta_seconds: Some(2),
         log: Some("Vidage des tampons d'écriture du noyau Linux (fsync + sync)...".to_string()),
         completed: false,
         error: None,
@@ -1366,7 +1331,6 @@ fn run_linux_dd_flash(
         speed_mbps: avg_speed,
         bytes_processed: bytes_written,
         total_bytes,
-        eta_seconds: Some(0),
         log: Some(format!(
             "Flashage DD terminé avec succès : {} écrits à {:.1} Mo/s de moyenne.",
             format_size(bytes_written),
@@ -1461,7 +1425,6 @@ fn run_windows_uefi_flash(
         speed_mbps: 0.0,
         bytes_processed: 0,
         total_bytes: total_iso_bytes,
-        eta_seconds: None,
         log: Some(format!("Exécution de wipefs -a sur {}", config.device_path)),
         completed: false,
         error: None,
@@ -1491,7 +1454,6 @@ fn run_windows_uefi_flash(
         speed_mbps: 0.0,
         bytes_processed: 0,
         total_bytes: total_iso_bytes,
-        eta_seconds: None,
         log: Some(format!(
             "Création de la table de partitions {} et de la partition principale sur {}...",
             scheme_label.to_uppercase(),
@@ -1588,7 +1550,6 @@ fn run_windows_uefi_flash(
         speed_mbps: 0.0,
         bytes_processed: 0,
         total_bytes: total_iso_bytes,
-        eta_seconds: None,
         log: Some(format!(
             "Formatage du système de fichiers {} (Label: {}) sur {}...",
             config.fs_type.as_str().to_uppercase(),
@@ -1643,7 +1604,6 @@ fn run_windows_uefi_flash(
         speed_mbps: 0.0,
         bytes_processed: 0,
         total_bytes: total_iso_bytes,
-        eta_seconds: None,
         log: Some(format!(
             "Montage loop de l'ISO sur {iso_mnt_str} et de {part_path} sur {usb_mnt_str}"
         )),
@@ -1756,7 +1716,6 @@ fn run_windows_uefi_flash(
                 speed_mbps: speed,
                 bytes_processed: copied_bytes,
                 total_bytes: total_iso_bytes,
-                eta_seconds: None,
                 log: Some(format!(
                     "Copie du fichier système : {rel_display} ({:.1}%)",
                     copy_percent(copied_bytes)
@@ -1783,23 +1742,13 @@ fn run_windows_uefi_flash(
                 let speed_mbps = (copied_bytes as f64 / (1024.0 * 1024.0)) / elapsed;
                 let percent = copy_percent(copied_bytes);
 
-                let rem = total_work_bytes.saturating_sub(copied_bytes);
-                let bps = copied_bytes as f64 / elapsed;
-                let eta = if bps > 1024.0 {
-                    Some((rem as f64 / bps) as u64)
-                } else {
-                    None
-                };
-
                 let log = (now.duration_since(last_log) >= Duration::from_secs(2)).then(|| {
                     format!(
-                        "Copie : {:.1}% — {} / {} — {:.0} Mo/s — reste {}",
+                        "Copie : {:.1}% — {} / {} — {:.0} Mo/s",
                         percent,
                         format_gib(copied_bytes),
                         format_gib(total_work_bytes),
                         speed_mbps,
-                        eta.map(format_duration)
-                            .unwrap_or_else(|| "calcul…".to_string())
                     )
                 });
                 if log.is_some() {
@@ -1812,7 +1761,6 @@ fn run_windows_uefi_flash(
                     speed_mbps,
                     bytes_processed: copied_bytes,
                     total_bytes: total_iso_bytes,
-                    eta_seconds: eta,
                     log,
                     completed: false,
                     error: None,
@@ -1842,7 +1790,6 @@ fn run_windows_uefi_flash(
             speed_mbps: 0.0,
             bytes_processed: copied_bytes,
             total_bytes: total_iso_bytes,
-            eta_seconds: None,
             log: Some(format!(
                 "Découpage de {} ({}) en volumes .swm de 3800 Mio max via {wim_bin}...",
                 wim_src_path.display(),
@@ -1877,7 +1824,6 @@ fn run_windows_uefi_flash(
             speed_mbps: 0.0,
             bytes_processed: copied_bytes,
             total_bytes: total_iso_bytes,
-            eta_seconds: Some(2),
             log: Some(format!(
                 "Découpage terminé : {} de volumes .swm générés.",
                 format_gib(wim_size)
@@ -1908,7 +1854,6 @@ fn run_windows_uefi_flash(
                 speed_mbps: 0.0,
                 bytes_processed: copied_bytes,
                 total_bytes: total_iso_bytes,
-                eta_seconds: Some(4),
                 log: Some(format!(
                     "Génération de /autounattend.xml (Compte local : '{}', BypassNRO : {}) et de {} fonctions Debloat dans sources/$OEM$/$$/Setup/Scripts/noos_debloat.ps1",
                     win_custom.local_username,
@@ -1930,7 +1875,6 @@ fn run_windows_uefi_flash(
         speed_mbps: 0.0,
         bytes_processed: copied_bytes,
         total_bytes: total_iso_bytes,
-        eta_seconds: Some(3),
         log: Some(
             "Synchronisation des écritures et démontage propre de la clé USB (sync + umount)..."
                 .to_string(),
@@ -1968,7 +1912,6 @@ fn run_windows_uefi_flash(
         speed_mbps: avg_speed,
         bytes_processed: total_iso_bytes,
         total_bytes: total_iso_bytes,
-        eta_seconds: Some(0),
         log: Some(format!(
             "Clé USB Windows UEFI ({}/{}) prête à démarrer ({:.1} Mo/s).",
             config.partition_scheme.as_str().to_uppercase(),
