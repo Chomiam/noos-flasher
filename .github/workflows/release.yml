@@ -27,9 +27,12 @@ jobs:
           fetch-depth: 0
 
       - name: "Installation des dépendances système (GTK4, Libadwaita, outils USB/NTFS)"
+        env:
+          DEBIAN_FRONTEND: noninteractive
+          NEEDRESTART_MODE: a
         run: |
-          sudo apt-get update
-          sudo apt-get install -y \
+          sudo -E apt-get update
+          sudo -E apt-get install -y \
             build-essential \
             pkg-config \
             libgtk-4-dev \
