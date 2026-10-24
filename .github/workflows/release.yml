@@ -158,7 +158,7 @@ jobs:
           body: |
             ## Noos Flasher ${{ steps.artifacts.outputs.TAG }} — Créateur de clés USB bootables Linux & Windows UEFI
 
-            Interface native **GTK4 / Libadwaita** (remplace le frontend Tauri v2), backend Rust conservé pour l'inspection ISO, l'écriture DD, le partitionnement Windows UEFI et le Debloat Studio.
+            Interface native **GTK4 / Libadwaita** et backend Rust pour l'inspection ISO, l'écriture DD, le partitionnement Windows UEFI et le Debloat Studio.
 
             ### Dépendances livrées
             - **`ntfs-3g`** et **`ntfsprogs`** sont déclarés dans les paquets Arch (`PKGBUILD`), RPM et dans les prérequis Debian (où `ntfs-3g` fournit `mkntfs`/`ntfsfix`).
