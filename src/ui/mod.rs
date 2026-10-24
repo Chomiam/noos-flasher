@@ -12,6 +12,7 @@ pub fn run() -> glib::ExitCode {
     let initial_iso = std::env::args().skip(1).find(|arg| !arg.starts_with('-'));
 
     let app = adw::Application::builder().application_id(APP_ID).build();
+    gtk::Window::set_default_icon_name(APP_ID);
 
     app.connect_startup(|_| style::load_css());
     app.connect_activate(move |app| window::present(app, initial_iso.clone()));
