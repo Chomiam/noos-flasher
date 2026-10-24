@@ -135,7 +135,8 @@ jobs:
           mkdir -p release-assets
           cp target/debian/*.deb release-assets/ 2>/dev/null || cp target/*.deb release-assets/
           cp target/generate-rpm/*.rpm release-assets/
-          cp ./*.AppImage release-assets/
+          # Ne pas inclure le binaire linuxdeploy lui-même dans les artefacts.
+          find . -maxdepth 1 -name 'Noos_Flasher-*.AppImage' -exec cp {} release-assets/ \;
           cd release-assets
           sha256sum *.deb *.rpm *.AppImage > SHA256SUMS.txt
           cat SHA256SUMS.txt
